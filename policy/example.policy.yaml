@@ -1,0 +1,36 @@
+# Example policy. Validates against policy.schema.json.
+# Rules run top to bottom. The first rule that matches decides.
+#
+# In a `when` expression, `args` is the tool call's arguments and `agent` is
+# the name the agent sent in the `x-agent-name` header (empty if none).
+# A rule that applies to a call but cannot be evaluated (for example a missing
+# argument) blocks the call. Use has(args.field) for optional arguments.
+
+version: 1
+mode: enforce      # switch to shadow to log decisions without blocking
+default: allow     # what happens when no rule matches
+
+rules:
+  - id: no-production-db-drop
+    description: Agents never delete the production database.
+    match:
+      tool: db_drop
+    when: args.database == "production"
+    action: deny
+    message: Dropping the production database is blocked by policy.
+
+  - id: refund-cap
+    description: Refunds above 500 need a human.
+    match:
+      tool: stripe_refund
+    when: args.amount > 500
+    action: review
+    message: Refunds above 500 are held for human approval.
+
+  - id: email-allowlist
+    description: Email only goes to our own domain.
+    match:
+      tool: "email_*"
+    when: '!args.to.all(r, r.endsWith("@example.com"))'
+    action: deny
+    message: At least one recipient is outside the allowed domain.

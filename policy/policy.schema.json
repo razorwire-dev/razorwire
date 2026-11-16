@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Razorwire policy",
+  "description": "Rules that decide what happens to a tool call before it executes. Rules are evaluated top to bottom and the first match wins.",
+  "type": "object",
+  "required": ["version", "rules"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "description": "Schema version of this file.",
+      "const": 1
+    },
+    "mode": {
+      "description": "enforce: decisions are applied. shadow: decisions are logged and every call is allowed through.",
+      "enum": ["enforce", "shadow"],
+      "default": "enforce"
+    },
+    "default": {
+      "description": "Decision for a tool call that no rule matches.",
+      "enum": ["allow", "deny", "review"],
+      "default": "allow"
+    },
+    "rules": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/rule" }
+    }
+  },
+  "$defs": {
+    "rule": {
+      "type": "object",
+      "required": ["id", "match", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "Stable identifier. Appears in the audit log next to every decision this rule makes.",
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "description": {
+          "type": "string"
+        },
+        "match": {
+          "description": "Which tool calls this rule applies to.",
+          "type": "object",
+          "required": ["tool"],
+          "additionalProperties": false,
+          "properties": {
+            "tool": {
+              "description": "Tool name. `*` matches any run of characters, so `db_*` matches `db_query` and `db_drop`.",
+              "type": "string",
+              "minLength": 1
+            },
+            "agent": {
+              "description": "Optional agent name, as sent in the `x-agent-name` header, same wildcard rules. Omit to match every agent.",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "when": {
+          "description": "Optional CEL expression that must be true for the rule to fire. `args` is the tool call's arguments, `agent` is the name sent in the `x-agent-name` header. Omit to fire on every matched call. If the expression cannot be evaluated for a matched call, the call is blocked.",
+          "type": "string",
+          "minLength": 1
+        },
+        "action": {
+          "description": "allow: run it. deny: block it and return `message` to the agent. review: hold it for a human. Until an approval flow exists, review blocks the call like deny.",
+          "enum": ["allow", "deny", "review"]
+        },
+        "message": {
+          "description": "Returned to the agent and written to the audit log when the rule denies or holds a call.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}
