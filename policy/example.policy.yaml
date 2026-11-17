@@ -1,8 +1,17 @@
 # Example policy. Validates against policy.schema.json.
 # Rules run top to bottom. The first rule that matches decides.
 #
-# In a `when` expression, `args` is the tool call's arguments and `agent` is
-# the name the agent sent in the `x-agent-name` header (empty if none).
+# In a `when` expression:
+#   args    the tool call's arguments
+#   agent   the name the agent sent in the `x-agent-name` header (empty if none)
+#   run     what already happened in this run, counted from the conversation
+#           the agent sent:
+#             run.calls      tool calls the agent received so far
+#             run.same_tool  of those, calls to this same tool
+#             run.repeats    of those, calls with these same arguments
+#             run.streak     times in a row, just before, it made exactly this call
+#             run.blocked    calls Razorwire blocked so far
+#
 # A rule that applies to a call but cannot be evaluated (for example a missing
 # argument) blocks the call. Use has(args.field) for optional arguments.
 
@@ -11,6 +20,43 @@ mode: enforce      # switch to shadow to log decisions without blocking
 default: allow     # what happens when no rule matches
 
 rules:
+  # Loop guard: brakes for an agent that runs on its own.
+
+  - id: three-strikes
+    description: After three blocked calls, block everything until a human looks.
+    match:
+      tool: "*"
+    when: run.blocked >= 3
+    action: deny
+    message: Three tool calls in this run were already blocked, so every further call is blocked. Stop and ask a human.
+
+  - id: run-budget
+    description: A hard cap on how much one run can do.
+    match:
+      tool: "*"
+    when: run.calls >= 50
+    action: deny
+    message: This run has used its budget of 50 tool calls. Stop here.
+
+  # A tool that is meant to be polled can be let through for longer with an
+  # allow rule here, above stuck-in-a-loop. For example:
+  #
+  # - id: deploys-can-be-polled
+  #   match:
+  #     tool: deploy_status
+  #   when: run.streak < 20
+  #   action: allow
+
+  - id: stuck-in-a-loop
+    description: The same call with the same arguments three times in a row means the agent is stuck.
+    match:
+      tool: "*"
+    when: run.streak >= 2
+    action: deny
+    message: This exact call was just made twice in a row, so the agent looks stuck. Stop and report back instead of retrying.
+
+  # What the agent may do at all.
+
   - id: no-production-db-drop
     description: Agents never delete the production database.
     match:

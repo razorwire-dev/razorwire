@@ -19,7 +19,7 @@ Open-source core (MIT), paid hosted control plane later.
 
 | Stage | Job | Status |
 |---|---|---|
-| 1. Policy | Block an action before it executes: scope, limits, blast radius | Working, streamed and non-streamed |
+| 1. Policy | Block an action before it executes: scope, limits, blast radius | Working, streamed and non-streamed, with a loop guard |
 | 2. Sandbox | Shadow mode (log what would have happened) and rollback | Shadow mode works. Rollback not started |
 | 3. Verify | Check ground truth through a separate path, never the agent's own "done" | Not started |
 | 4. Attest | Tamper-evident, exportable log of every decision | Plain JSONL only, not signed |
@@ -43,9 +43,10 @@ README.md                    public front page: what it is, demo, how to run
 Cargo.toml                   crate manifest
 src/main.rs                  the proxy: startup, forwarding, refusals
 src/policy.rs                policy files: load, validate, decide
-src/openai.rs                find tool calls in provider payloads, remove blocked ones
+src/openai.rs                find tool calls in provider payloads, remove blocked ones,
+                             count the run from the conversation history
 src/sse.rs                   streamed replies: reassemble them, rebuild them after a block
-examples/demo_agent.rs       reckless agent that tries to drop two databases
+examples/demo_agent.rs       reckless agents: one drops databases, one gets stuck polling
 policy/policy.schema.json    JSON Schema for policy files
 policy/example.policy.yaml   example policy, also used by the unit tests
 ```
@@ -85,13 +86,29 @@ A streamed reply (`"stream": true`) spreads each tool call over many events.
 - **No policy, or shadow mode:** the stream passes through live and is read
   on the side, so tool calls and decisions still reach the audit log.
 
+### Loop guard
+
+Agents resend the whole conversation with every request, so the proxy reads
+where a run stands from the request itself and keeps no state between
+requests. `openai::History` counts the assistant's earlier tool calls (Chat
+Completions `messages`, Responses API `input`) and the `[razorwire]` block
+notes in the assistant's earlier messages. Calls earlier in the same response
+count too: those passed on, and those blocked. Each choice of an `n > 1`
+reply is counted on its own.
+
+Rules read the counts as `run` (`calls`, `same_tool`, `repeats`, `streak`,
+`blocked`). The variable is `run` because CEL reserves the word `loop`. A
+blocked call never reaches the agent, so it is not in `calls` and does not
+break or extend a streak; it is counted in `blocked`.
+
 ## Policy files
 
 Format: `policy/policy.schema.json`. Example: `policy/example.policy.yaml`.
 
 - `match.tool` and `match.agent` take `*` as a wildcard.
 - `when` is a CEL expression. `args` is the tool call's decoded arguments,
-  `agent` is the value of the `x-agent-name` request header (empty if unset).
+  `agent` is the value of the `x-agent-name` request header (empty if unset),
+  `run` holds the loop guard counts.
 - A rule that matches a call but whose `when` cannot be evaluated (for example
   a missing argument) blocks the call. Guard optional fields with
   `has(args.field)`.
@@ -103,8 +120,9 @@ Format: `policy/policy.schema.json`. Example: `policy/example.policy.yaml`.
 
 One JSON object per line in `audit.jsonl`:
 
-- `tool_call`: a tool call the model asked for. With a policy loaded it also
-  carries `decision`, `rule`, `blocked`, and `reason` when not allowed.
+- `tool_call`: a tool call the model asked for, with its `run` counts. With a
+  policy loaded it also carries `decision`, `rule`, `blocked`, and `reason`
+  when not allowed.
 - `tool_result`: a tool result the agent sent back, logged once per call id.
 - `response_refused`: the proxy withheld a response it could not check.
 
@@ -115,10 +133,16 @@ One JSON object per line in `audit.jsonl`:
 - **Rebuilt streams are minimal.** When a call is blocked, the rebuilt Chat
   Completions stream carries the text and the remaining tool calls; other
   streamed fields such as reasoning are dropped. The rebuilt Responses API
-  stream has only the start, item and final events, and has been tested
-  against a fake provider only, not against a real SDK.
-- **Not yet tested with real agent SDKs.** Verified with raw HTTP clients
-  against Groq, not with the OpenAI SDK, LangGraph or CrewAI.
+  stream has only the start, item and final events. Both parse in the
+  OpenAI Python SDK.
+- **One SDK tested.** Verified against Groq with raw HTTP clients and with
+  the OpenAI Python SDK 3.53: Chat Completions (plain, streamed, and the
+  SDK's stream helper) and the Responses API (plain and streamed). Not yet
+  tested with LangGraph or CrewAI.
+- **Loop counts trust the conversation.** An agent that trims or rewrites
+  its history starts its counts over. With the Responses API's
+  `previous_response_id`, only the turns in the request are counted. In
+  shadow mode nothing is blocked, so `run.blocked` stays 0.
 - **Coverage.** Only OpenAI-compatible payloads are understood. Tools the
   provider runs itself (web search, code interpreter) and the Responses API's
   computer and shell calls are not checked.
@@ -165,12 +189,18 @@ Terminal 2, the agent:
 
 ```
 cargo run --example demo_agent
+cargo run --example demo_agent -- loop
 ```
 
-The agent is told to drop the staging and production databases. With the
-policy loaded, staging is dropped and production survives. Start the proxy
-without `POLICY_FILE` and both are dropped. The agent reads `GROQ_API_KEY`
-from the environment or from `.env`.
+The first agent is told to drop the staging and production databases. With
+the policy loaded, staging is dropped and production survives. Start the
+proxy without `POLICY_FILE` and both are dropped.
+
+The second agent is told to wait for a deploy that never finishes. With the
+policy loaded, `stuck-in-a-loop` stops it after two status checks. Without
+it, the agent keeps checking until the demo's own cap of 12 turns.
+
+The agents read `GROQ_API_KEY` from the environment or from `.env`.
 
 ## Stack
 
@@ -195,7 +225,7 @@ from the environment or from `.env`.
 | 8 | Hosted control plane and Stripe billing |
 
 Next up, in order: an approval flow for `review`, policy reload without a
-restart, testing with real agent SDKs, an easy install.
+restart, testing with LangGraph and CrewAI, an easy install.
 
 ## Conventions
 

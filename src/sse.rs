@@ -423,7 +423,7 @@ pub fn responses_stream(final_event: &str, response: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openai::inspect_response;
+    use crate::openai::{inspect_response, History};
     use crate::policy::Policy;
 
     const EXAMPLE: &str = include_str!("../policy/example.policy.yaml");
@@ -585,7 +585,7 @@ mod tests {
         else {
             panic!("expected a chat stream");
         };
-        let inspection = inspect_response(&mut completion, Some(&policy), "");
+        let inspection = inspect_response(&mut completion, Some(&policy), "", &History::default());
         assert_eq!(inspection.blocked, 1);
 
         // Read the rebuilt stream back the way a client would.
@@ -617,7 +617,7 @@ mod tests {
         let Captured::Chat(mut completion) = capture(&drop_stream(&["production"])) else {
             panic!("expected a chat stream");
         };
-        inspect_response(&mut completion, Some(&policy), "");
+        inspect_response(&mut completion, Some(&policy), "", &History::default());
 
         let Captured::Chat(seen) = capture(&chat_stream(&completion)) else {
             panic!("the rebuilt stream should be a chat stream");
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(seen, response);
 
         let policy = Policy::parse(EXAMPLE).expect("example policy should parse");
-        let inspection = inspect_response(&mut seen, Some(&policy), "");
+        let inspection = inspect_response(&mut seen, Some(&policy), "", &History::default());
         assert_eq!(inspection.blocked, 1);
 
         let rebuilt = responses_stream(&name, &seen);

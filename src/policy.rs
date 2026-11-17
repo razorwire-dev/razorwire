@@ -7,7 +7,7 @@ use std::{collections::HashMap, collections::HashSet, fmt, sync::Arc};
 
 use cel::{Context, Env, Program, RuntimeOptions, Value as CelValue};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Upper bound on loop iterations inside one `when` expression, so a rule such
 /// as `args.items.all(...)` cannot be made to spin on a huge argument list.
@@ -59,6 +59,40 @@ pub struct Decision {
 impl Decision {
     pub fn is_allowed(&self) -> bool {
         self.action == Action::Allow
+    }
+}
+
+/// What already happened in the agent's run before this tool call, counted
+/// from the conversation the agent sent with its request. Rules read it as
+/// `run`, so a policy can stop an agent that is stuck or has done too much.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunCounts {
+    /// Tool calls the agent received earlier in this run.
+    pub calls: u64,
+    /// Of those, calls to the same tool.
+    pub same_tool: u64,
+    /// Of those, calls to the same tool with the same arguments.
+    pub repeats: u64,
+    /// How many times in a row, just before this call, the agent made exactly
+    /// this call. Asking for the same thing over and over is a stuck loop.
+    pub streak: u64,
+    /// Tool calls Razorwire blocked earlier in this run.
+    pub blocked: u64,
+}
+
+impl RunCounts {
+    /// The counts as a JSON object, for the audit log and for rules. Counts
+    /// are capped at the largest signed integer so that rules always see CEL
+    /// integers and `run.calls > 50` compares like with like.
+    pub fn as_json(&self) -> Value {
+        let int = |count: u64| i64::try_from(count).unwrap_or(i64::MAX);
+        json!({
+            "calls": int(self.calls),
+            "same_tool": int(self.same_tool),
+            "repeats": int(self.repeats),
+            "streak": int(self.streak),
+            "blocked": int(self.blocked),
+        })
     }
 }
 
@@ -211,7 +245,7 @@ impl Policy {
 
     /// Decide what happens to one tool call. Fails closed: a rule that applies
     /// to the call but cannot be evaluated denies it.
-    pub fn decide(&self, agent: &str, tool: &str, args: &Value) -> Decision {
+    pub fn decide(&self, agent: &str, tool: &str, args: &Value, run: &RunCounts) -> Decision {
         for rule in &self.rules {
             if !glob_match(&rule.tool, tool) {
                 continue;
@@ -223,7 +257,7 @@ impl Policy {
             }
             let fires = match &rule.when {
                 None => Ok(true),
-                Some(program) => self.evaluate(program, agent, args),
+                Some(program) => self.evaluate(program, agent, args, run),
             };
             match fires {
                 Ok(false) => continue,
@@ -270,10 +304,18 @@ impl Policy {
         }
     }
 
-    fn evaluate(&self, program: &Program, agent: &str, args: &Value) -> Result<bool, String> {
+    fn evaluate(
+        &self,
+        program: &Program,
+        agent: &str,
+        args: &Value,
+        run: &RunCounts,
+    ) -> Result<bool, String> {
         let mut context = Context::with_env(self.env.clone());
         context.add_variable_from_value("args", to_cel(args));
         context.add_variable_from_value("agent", agent);
+        // `run`, not `loop`: CEL reserves the word `loop`.
+        context.add_variable_from_value("run", to_cel(&run.as_json()));
         match program.execute(&context) {
             Ok(CelValue::Bool(result)) => Ok(result),
             Ok(other) => Err(format!(
@@ -358,6 +400,123 @@ mod tests {
         Policy::parse(text).expect("policy should parse")
     }
 
+    impl Policy {
+        /// `decide` for a call that starts a run, with nothing before it.
+        fn check(&self, agent: &str, tool: &str, args: &Value) -> Decision {
+            self.decide(agent, tool, args, &RunCounts::default())
+        }
+    }
+
+    fn run(calls: u64, same_tool: u64, repeats: u64, streak: u64, blocked: u64) -> RunCounts {
+        RunCounts {
+            calls,
+            same_tool,
+            repeats,
+            streak,
+            blocked,
+        }
+    }
+
+    #[test]
+    fn rules_can_read_the_run() {
+        let policy = policy(
+            r#"
+version: 1
+rules:
+  - id: polls
+    match: { tool: deploy_status }
+    when: run.same_tool >= 10 || run.streak >= 5
+    action: deny
+  - id: busy
+    match: { tool: "*" }
+    when: run.calls > 3 && run.blocked == 0 && run.repeats < 1
+    action: review
+"#,
+        );
+        let args = json!({ "deploy_id": 42 });
+
+        let fresh = policy.decide("", "deploy_status", &args, &run(0, 0, 0, 0, 0));
+        assert!(fresh.is_allowed(), "{fresh:?}");
+
+        let polled = policy.decide("", "deploy_status", &args, &run(10, 10, 0, 0, 0));
+        assert_eq!(polled.rule.as_deref(), Some("polls"));
+        assert!(polled.error.is_none());
+
+        let streak = policy.decide("", "deploy_status", &args, &run(5, 5, 5, 5, 0));
+        assert_eq!(streak.rule.as_deref(), Some("polls"));
+
+        let busy = policy.decide("", "other", &args, &run(4, 0, 0, 0, 0));
+        assert_eq!(busy.rule.as_deref(), Some("busy"));
+        assert_eq!(busy.action, Action::Review);
+
+        let repeated = policy.decide("", "other", &args, &run(4, 0, 1, 0, 0));
+        assert!(repeated.is_allowed(), "{repeated:?}");
+    }
+
+    #[test]
+    fn example_policy_guards_the_loop() {
+        let policy = policy(EXAMPLE);
+        let harmless = json!({ "query": "status" });
+        let decide = |counts| policy.decide("", "web_search", &harmless, &counts);
+
+        // Repeating a call with other calls in between is not being stuck.
+        assert!(decide(run(49, 49, 9, 1, 2)).is_allowed());
+
+        let stuck = run(2, 2, 2, 2, 0);
+        let strikes = run(3, 0, 0, 0, 3);
+        let budget = run(50, 0, 0, 0, 0);
+        assert_eq!(decide(stuck).rule.as_deref(), Some("stuck-in-a-loop"));
+        assert_eq!(decide(strikes).rule.as_deref(), Some("three-strikes"));
+        assert_eq!(decide(budget).rule.as_deref(), Some("run-budget"));
+        for counts in [stuck, strikes, budget] {
+            let decision = decide(counts);
+            assert_eq!(decision.action, Action::Deny, "{decision:?}");
+            assert!(decision.error.is_none(), "{decision:?}");
+        }
+    }
+
+    #[test]
+    fn a_polled_tool_can_be_let_through_for_longer() {
+        // The tip in the example policy, uncommented, must work as described.
+        let tip = "  # - id: deploys-can-be-polled\n  #   match:\n  #     tool: deploy_status\n  #   when: run.streak < 20\n  #   action: allow\n";
+        assert!(EXAMPLE.contains(tip), "the example policy lost the tip");
+        let policy = policy(&EXAMPLE.replace(tip, &tip.replace("  # ", "  ")));
+        let args = json!({ "deploy_id": 42 });
+        let at = |counts| policy.decide("", "deploy_status", &args, &counts);
+
+        assert!(at(run(5, 5, 5, 5, 0)).is_allowed());
+        assert_eq!(
+            at(run(20, 20, 20, 20, 0)).rule.as_deref(),
+            Some("stuck-in-a-loop")
+        );
+        // The strikes and the budget still apply to the polled tool.
+        assert_eq!(
+            at(run(5, 5, 5, 5, 3)).rule.as_deref(),
+            Some("three-strikes")
+        );
+        assert_eq!(at(run(50, 5, 5, 5, 0)).rule.as_deref(), Some("run-budget"));
+        // Other tools are still stopped early.
+        let other = policy.decide("", "web_search", &args, &run(2, 2, 2, 2, 0));
+        assert_eq!(other.rule.as_deref(), Some("stuck-in-a-loop"));
+    }
+
+    #[test]
+    fn run_counts_reach_rules_and_the_log_as_numbers() {
+        let counts = run(1, 2, 3, 4, 5).as_json();
+        assert_eq!(
+            counts,
+            json!({ "calls": 1, "same_tool": 2, "repeats": 3, "streak": 4, "blocked": 5 })
+        );
+        // The largest count is capped, and still compares without an error.
+        assert_eq!(run(u64::MAX, 0, 0, 0, 0).as_json()["calls"], i64::MAX);
+        let policy = policy(
+            "version: 1\nrules:\n  - id: a\n    match: { tool: x }\n    when: run.calls > 0\n    action: deny\n",
+        );
+        let huge = policy.decide("", "x", &json!({}), &run(u64::MAX, 0, 0, 0, 0));
+        assert_eq!(huge.action, Action::Deny, "{huge:?}");
+        assert!(huge.error.is_none(), "{huge:?}");
+    }
+
     #[test]
     fn glob_matches_wildcards() {
         assert!(glob_match("db_drop", "db_drop"));
@@ -379,7 +538,7 @@ mod tests {
     #[test]
     fn example_policy_blocks_production_drop() {
         let policy = policy(EXAMPLE);
-        let decision = policy.decide("", "db_drop", &json!({ "database": "production" }));
+        let decision = policy.check("", "db_drop", &json!({ "database": "production" }));
         assert_eq!(decision.action, Action::Deny);
         assert_eq!(decision.rule.as_deref(), Some("no-production-db-drop"));
         assert!(decision.error.is_none());
@@ -388,7 +547,7 @@ mod tests {
     #[test]
     fn example_policy_allows_staging_drop() {
         let policy = policy(EXAMPLE);
-        let decision = policy.decide("", "db_drop", &json!({ "database": "staging" }));
+        let decision = policy.check("", "db_drop", &json!({ "database": "staging" }));
         assert!(decision.is_allowed());
         assert_eq!(decision.rule, None);
     }
@@ -396,37 +555,37 @@ mod tests {
     #[test]
     fn example_policy_holds_large_refunds() {
         let policy = policy(EXAMPLE);
-        let large = policy.decide("", "stripe_refund", &json!({ "amount": 47000 }));
+        let large = policy.check("", "stripe_refund", &json!({ "amount": 47000 }));
         assert_eq!(large.action, Action::Review);
         assert_eq!(large.rule.as_deref(), Some("refund-cap"));
 
-        let small = policy.decide("", "stripe_refund", &json!({ "amount": 20 }));
+        let small = policy.check("", "stripe_refund", &json!({ "amount": 20 }));
         assert!(small.is_allowed());
 
-        let boundary = policy.decide("", "stripe_refund", &json!({ "amount": 500 }));
+        let boundary = policy.check("", "stripe_refund", &json!({ "amount": 500 }));
         assert!(boundary.is_allowed());
     }
 
     #[test]
     fn refund_cap_handles_decimal_amounts() {
         let policy = policy(EXAMPLE);
-        let over = policy.decide("", "stripe_refund", &json!({ "amount": 500.01 }));
+        let over = policy.check("", "stripe_refund", &json!({ "amount": 500.01 }));
         assert_eq!(over.action, Action::Review, "{over:?}");
-        let under = policy.decide("", "stripe_refund", &json!({ "amount": 499.99 }));
+        let under = policy.check("", "stripe_refund", &json!({ "amount": 499.99 }));
         assert!(under.is_allowed(), "{under:?}");
     }
 
     #[test]
     fn example_policy_checks_every_email_recipient() {
         let policy = policy(EXAMPLE);
-        let inside = policy.decide(
+        let inside = policy.check(
             "",
             "email_send",
             &json!({ "to": ["a@example.com", "b@example.com"] }),
         );
         assert!(inside.is_allowed(), "{inside:?}");
 
-        let outside = policy.decide(
+        let outside = policy.check(
             "",
             "email_send",
             &json!({ "to": ["a@example.com", "attacker@evil.test"] }),
@@ -439,7 +598,7 @@ mod tests {
     fn a_rule_that_cannot_be_evaluated_denies() {
         let policy = policy(EXAMPLE);
         // No `database` field, so `args.database == "production"` has no answer.
-        let decision = policy.decide("", "db_drop", &json!({}));
+        let decision = policy.check("", "db_drop", &json!({}));
         assert_eq!(decision.action, Action::Deny);
         assert_eq!(decision.rule.as_deref(), Some("no-production-db-drop"));
         assert!(decision.error.is_some());
@@ -448,7 +607,7 @@ mod tests {
     #[test]
     fn arguments_that_are_not_an_object_deny_on_matching_rules() {
         let policy = policy(EXAMPLE);
-        let decision = policy.decide("", "db_drop", &json!("drop everything"));
+        let decision = policy.check("", "db_drop", &json!("drop everything"));
         assert_eq!(decision.action, Action::Deny);
         assert!(decision.error.is_some());
     }
@@ -468,11 +627,11 @@ rules:
     action: deny
 "#,
         );
-        let read = policy.decide("", "db_query", &json!({ "operation": "read" }));
+        let read = policy.check("", "db_query", &json!({ "operation": "read" }));
         assert_eq!(read.rule.as_deref(), Some("allow-reads"));
         assert!(read.is_allowed());
 
-        let write = policy.decide("", "db_query", &json!({ "operation": "write" }));
+        let write = policy.check("", "db_query", &json!({ "operation": "write" }));
         assert_eq!(write.rule.as_deref(), Some("deny-db"));
         assert_eq!(write.action, Action::Deny);
         assert_eq!(write.message, "Blocked by policy rule deny-db.");
@@ -490,8 +649,8 @@ rules:
     action: allow
 "#,
         );
-        assert!(policy.decide("", "web_search", &json!({})).is_allowed());
-        let other = policy.decide("", "shell_exec", &json!({}));
+        assert!(policy.check("", "web_search", &json!({})).is_allowed());
+        let other = policy.check("", "shell_exec", &json!({}));
         assert_eq!(other.action, Action::Deny);
         assert_eq!(other.rule, None);
     }
@@ -511,13 +670,13 @@ rules:
     action: deny
 "#,
         );
-        let intern = policy.decide("intern-7", "stripe_refund", &json!({ "amount": 1 }));
+        let intern = policy.check("intern-7", "stripe_refund", &json!({ "amount": 1 }));
         assert_eq!(intern.rule.as_deref(), Some("intern-cannot-pay"));
 
-        let support = policy.decide("support", "stripe_refund", &json!({ "amount": 150 }));
+        let support = policy.check("support", "stripe_refund", &json!({ "amount": 150 }));
         assert_eq!(support.rule.as_deref(), Some("support-small-refunds-only"));
 
-        let finance = policy.decide("finance", "stripe_refund", &json!({ "amount": 150 }));
+        let finance = policy.check("finance", "stripe_refund", &json!({ "amount": 150 }));
         assert!(finance.is_allowed());
     }
 
@@ -533,11 +692,11 @@ rules:
     action: deny
 "#,
         );
-        assert!(policy.decide("", "git_push", &json!({})).is_allowed());
+        assert!(policy.check("", "git_push", &json!({})).is_allowed());
         assert!(policy
-            .decide("", "git_push", &json!({ "force": false }))
+            .check("", "git_push", &json!({ "force": false }))
             .is_allowed());
-        let forced = policy.decide("", "git_push", &json!({ "force": true }));
+        let forced = policy.check("", "git_push", &json!({ "force": true }));
         assert_eq!(forced.action, Action::Deny);
         assert!(forced.error.is_none());
     }
@@ -554,7 +713,7 @@ rules:
     action: allow
 "#,
         );
-        let decision = policy.decide("", "anything", &json!({ "amount": 5 }));
+        let decision = policy.check("", "anything", &json!({ "amount": 5 }));
         assert_eq!(decision.action, Action::Deny);
         assert!(decision.error.is_some());
     }
@@ -565,7 +724,7 @@ rules:
         assert_eq!(shadow.mode(), Mode::Shadow);
         let plain = policy("version: 1\nrules: []\n");
         assert_eq!(plain.mode(), Mode::Enforce);
-        assert!(plain.decide("", "anything", &json!({})).is_allowed());
+        assert!(plain.check("", "anything", &json!({})).is_allowed());
     }
 
     #[test]
@@ -588,10 +747,10 @@ rules:
             "text": "",
         });
         // Whatever the answer, deciding must not panic, and must not allow.
-        let decision = policy.decide("", "anything", &args);
+        let decision = policy.check("", "anything", &args);
         assert_eq!(decision.action, Action::Deny, "{decision:?}");
 
-        let empty = policy.decide("", "anything", &Value::Null);
+        let empty = policy.check("", "anything", &Value::Null);
         assert_eq!(empty.action, Action::Deny, "{empty:?}");
     }
 

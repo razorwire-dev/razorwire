@@ -51,6 +51,85 @@ RESULT    staging: DELETED
 
 The model still asked for it. The agent never got the chance to do it.
 
+## The loop guard
+
+An agent runs in a loop: ask the model, run the tool it picks, send back the
+result, repeat. Nothing in that loop knows when to stop. An agent can call
+the same tool forever, or keep pushing against a rule it was told about, and
+every turn costs money.
+
+Razorwire puts brakes on the loop. Every request from an agent carries the
+whole conversation so far, so Razorwire can count what already happened in
+the run without keeping any state of its own. Rules read those counts as
+`run`:
+
+| Count | Meaning |
+|---|---|
+| `run.calls` | Tool calls the agent received earlier in this run |
+| `run.same_tool` | Of those, calls to the same tool |
+| `run.repeats` | Of those, calls with the same arguments |
+| `run.streak` | Times in a row, just before this one, the agent made exactly this call |
+| `run.blocked` | Calls Razorwire blocked earlier in this run |
+
+The example policy ships three brakes:
+
+```yaml
+- id: three-strikes         # after three blocked calls, block everything
+  match: { tool: "*" }
+  when: run.blocked >= 3
+  action: deny
+
+- id: run-budget            # a hard cap on one run
+  match: { tool: "*" }
+  when: run.calls >= 50
+  action: deny
+
+- id: stuck-in-a-loop       # the same call three times in a row
+  match: { tool: "*" }
+  when: run.streak >= 2
+  action: deny
+```
+
+A demo agent is told to wait for a deploy that never finishes. Without a
+policy it never stops:
+
+```
+OPERATOR  Deploy 42 is rolling out. Check its status until it has finished, then tell me.
+AGENT     calls deploy_status(42)
+DEPLOY    42 is still pending
+AGENT     calls deploy_status(42)
+DEPLOY    42 is still pending
+          ... ten more times ...
+
+RESULT    deploy_status was called 12 times
+RESULT    the agent was still going when the demo cut it off after 12 turns
+```
+
+With the loop guard:
+
+```
+OPERATOR  Deploy 42 is rolling out. Check its status until it has finished, then tell me.
+AGENT     calls deploy_status(42)
+DEPLOY    42 is still pending
+AGENT     calls deploy_status(42)
+DEPLOY    42 is still pending
+AGENT     [razorwire] Blocked tool call "deploy_status": This exact call was just made twice in a row, so the agent looks stuck. Stop and report back instead of retrying. (rule: stuck-in-a-loop)
+
+RESULT    deploy_status was called 2 times
+RESULT    the agent stopped
+```
+
+A tool that is meant to be polled can be let through for longer. Rules run
+top to bottom and the first match decides, so put an allow rule just above
+`stuck-in-a-loop`:
+
+```yaml
+- id: deploys-can-be-polled
+  match: { tool: deploy_status }
+  when: run.streak < 20
+  action: allow
+```
+
 ## Run it
 
 You need [Rust](https://rustup.rs) and an API key for an OpenAI-compatible
@@ -70,10 +149,12 @@ Windows PowerShell:
 $env:UPSTREAM_URL="https://api.groq.com/openai"; $env:POLICY_FILE="policy/example.policy.yaml"; cargo run
 ```
 
-In a second terminal, run the agent:
+In a second terminal, run the agent that drops databases, or the one that
+gets stuck in a loop:
 
 ```
 cargo run --example demo_agent
+cargo run --example demo_agent -- loop
 ```
 
 ## Use it with your own agent
@@ -121,6 +202,7 @@ rules:
 - `match.tool` and `match.agent` accept `*` as a wildcard.
 - `when` is a [CEL](https://github.com/cel-expr/cel-spec) expression. `args`
   is the tool call's arguments. `agent` is the `x-agent-name` request header.
+  `run` holds the [loop guard](#the-loop-guard) counts.
 - Actions are `allow`, `deny` and `review`. For now `review` blocks like `deny`.
 - Start in `mode: shadow` to see what would be blocked before you enforce it.
 
@@ -141,7 +223,7 @@ Every tool call and every decision is appended to `audit.jsonl`, one JSON
 object per line. A shortened example:
 
 ```json
-{"event":"tool_call","tool":"db_drop","arguments":{"database":"production"},"decision":"deny","rule":"no-production-db-drop","blocked":true,"agent":"demo-agent"}
+{"event":"tool_call","tool":"db_drop","arguments":{"database":"production"},"run":{"calls":1,"same_tool":1,"repeats":0,"streak":0,"blocked":0},"decision":"deny","rule":"no-production-db-drop","blocked":true,"agent":"demo-agent"}
 ```
 
 ## Limits
@@ -150,8 +232,12 @@ object per line. A shortened example:
   reply, Razorwire holds it until it is complete, so the agent gets it in one
   burst instead of word by word. In shadow mode and with no policy, streams
   pass through live.
-- **Not yet tested with real agent SDKs.** It has been verified with raw HTTP
-  clients against Groq, not with the OpenAI SDK, LangGraph or CrewAI.
+- **Tested with one SDK so far.** Verified against Groq with raw HTTP clients
+  and with the official OpenAI Python SDK: Chat Completions and the Responses
+  API, streamed and not. Not yet tested with LangGraph or CrewAI.
+- **Loop counts come from the conversation the agent sends.** An agent that
+  trims or rewrites its history starts its counts over. With the Responses
+  API's `previous_response_id`, only the turns sent in the request are counted.
 - **OpenAI-compatible payloads only.** Chat Completions and the Responses API
   function and custom tool calls. Tools the provider runs itself are not checked.
 - **Only traffic through the proxy is protected.** An agent that can reach the

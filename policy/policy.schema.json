@@ -58,7 +58,7 @@
           }
         },
         "when": {
-          "description": "Optional CEL expression that must be true for the rule to fire. `args` is the tool call's arguments, `agent` is the name sent in the `x-agent-name` header. Omit to fire on every matched call. If the expression cannot be evaluated for a matched call, the call is blocked.",
+          "description": "Optional CEL expression that must be true for the rule to fire. `args` is the tool call's arguments, `agent` is the name sent in the `x-agent-name` header, and `run` counts what already happened in this run, read from the conversation the agent sent: `run.calls`, `run.same_tool`, `run.repeats`, `run.streak` and `run.blocked`. Omit to fire on every matched call. If the expression cannot be evaluated for a matched call, the call is blocked.",
           "type": "string",
           "minLength": 1
         },

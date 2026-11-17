@@ -201,25 +201,29 @@ async fn proxy(
         .unwrap_or("")
         .to_string();
 
-    let request_json: Option<Value> = serde_json::from_slice(&body).ok();
-
-    if let Some(request) = &request_json {
-        for (call_id, event) in openai::tool_results(request) {
-            let is_new = match call_id {
-                Some(id) => {
-                    let mut seen = state.seen_results.lock().await;
-                    if seen.len() >= MAX_SEEN_RESULTS {
-                        seen.clear();
+    // The conversation the agent sent tells us where its run stands. Read it
+    // here so the parsed request is not held while the provider answers.
+    let history = match serde_json::from_slice::<Value>(&body) {
+        Ok(request) => {
+            for (call_id, event) in openai::tool_results(&request) {
+                let is_new = match call_id {
+                    Some(id) => {
+                        let mut seen = state.seen_results.lock().await;
+                        if seen.len() >= MAX_SEEN_RESULTS {
+                            seen.clear();
+                        }
+                        seen.insert(id)
                     }
-                    seen.insert(id)
+                    None => true,
+                };
+                if is_new {
+                    state.record(request_id, event).await;
                 }
-                None => true,
-            };
-            if is_new {
-                state.record(request_id, event).await;
             }
+            openai::History::from_request(&request)
         }
-    }
+        Err(_) => openai::History::default(),
+    };
 
     let mut forward_headers = HeaderMap::new();
     for (name, value) in &headers {
@@ -258,6 +262,7 @@ async fn proxy(
                 &state,
                 request_id,
                 &agent,
+                &history,
                 uri.path(),
                 upstream,
                 &mut response_headers,
@@ -268,7 +273,7 @@ async fn proxy(
                 Err(refusal) => return *refusal,
             }
         } else {
-            watch_stream(state.clone(), request_id, agent, upstream)
+            watch_stream(state.clone(), request_id, agent, history, upstream)
         }
     } else {
         let bytes = match upstream.bytes().await {
@@ -282,8 +287,12 @@ async fn proxy(
 
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(mut response) => {
-                let inspection =
-                    openai::inspect_response(&mut response, state.policy.as_ref(), &agent);
+                let inspection = openai::inspect_response(
+                    &mut response,
+                    state.policy.as_ref(),
+                    &agent,
+                    &history,
+                );
                 for event in inspection.events {
                     state.record(request_id, event).await;
                 }
@@ -328,6 +337,7 @@ async fn police_stream(
     state: &AppState,
     request_id: u64,
     agent: &str,
+    history: &openai::History,
     path: &str,
     mut upstream: reqwest::Response,
     headers: &mut HeaderMap,
@@ -368,7 +378,7 @@ async fn police_stream(
         }
         Captured::Chat(mut completion) => {
             let inspection =
-                openai::inspect_response(&mut completion, state.policy.as_ref(), agent);
+                openai::inspect_response(&mut completion, state.policy.as_ref(), agent, history);
             let rebuilt = (inspection.blocked > 0).then(|| sse::chat_stream(&completion));
             (inspection, rebuilt)
         }
@@ -376,7 +386,8 @@ async fn police_stream(
             event,
             mut response,
         } => {
-            let inspection = openai::inspect_response(&mut response, state.policy.as_ref(), agent);
+            let inspection =
+                openai::inspect_response(&mut response, state.policy.as_ref(), agent, history);
             let rebuilt =
                 (inspection.blocked > 0).then(|| sse::responses_stream(&event, &response));
             (inspection, rebuilt)
@@ -405,19 +416,20 @@ fn watch_stream(
     state: Arc<AppState>,
     request_id: u64,
     agent: String,
+    history: openai::History,
     upstream: reqwest::Response,
 ) -> Body {
     let stream = stream::unfold(
-        Some((upstream, StreamCapture::default())),
+        Some((upstream, StreamCapture::default(), history)),
         move |progress| {
             let state = state.clone();
             let agent = agent.clone();
             async move {
-                let (mut upstream, mut capture) = progress?;
+                let (mut upstream, mut capture, history) = progress?;
                 match upstream.chunk().await {
                     Ok(Some(chunk)) => {
                         capture.feed(&chunk);
-                        Some((Ok(chunk), Some((upstream, capture))))
+                        Some((Ok(chunk), Some((upstream, capture, history))))
                     }
                     Ok(None) => {
                         let mut reply = match capture.finish() {
@@ -425,8 +437,12 @@ fn watch_stream(
                             Captured::Responses { response, .. } => response,
                             Captured::Unreadable(_) | Captured::Nothing => return None,
                         };
-                        let inspection =
-                            openai::inspect_response(&mut reply, state.policy.as_ref(), &agent);
+                        let inspection = openai::inspect_response(
+                            &mut reply,
+                            state.policy.as_ref(),
+                            &agent,
+                            &history,
+                        );
                         for event in inspection.events {
                             state.record(request_id, event).await;
                         }
