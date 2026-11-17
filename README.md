@@ -7,8 +7,8 @@ Every tool call the model asks for is checked against your rules. A call that
 breaks a rule is removed from the response before the agent receives it, so
 the agent has nothing to execute.
 
-Status: early. It works for non-streamed, OpenAI-compatible APIs. See
-[Limits](#limits).
+Status: early. It works for OpenAI-compatible APIs, streamed and
+non-streamed. See [Limits](#limits).
 
 ## The demo
 
@@ -146,8 +146,12 @@ object per line. A shortened example:
 
 ## Limits
 
-- **Streaming is not inspected yet.** With an enforced policy, requests with
-  `"stream": true` are refused. Without one they pass through unchecked.
+- **Streamed replies are delayed under enforcement.** To check a streamed
+  reply, Razorwire holds it until it is complete, so the agent gets it in one
+  burst instead of word by word. In shadow mode and with no policy, streams
+  pass through live.
+- **Not yet tested with real agent SDKs.** It has been verified with raw HTTP
+  clients against Groq, not with the OpenAI SDK, LangGraph or CrewAI.
 - **OpenAI-compatible payloads only.** Chat Completions and the Responses API
   function and custom tool calls. Tools the provider runs itself are not checked.
 - **Only traffic through the proxy is protected.** An agent that can reach the
@@ -157,9 +161,9 @@ object per line. A shortened example:
 
 ## Roadmap
 
-Streaming inspection, an approval flow for `review`, policy reload, rollback
-of executed actions, independent verification of results, and a signed audit
-log.
+An approval flow for `review`, policy reload, live streaming under
+enforcement, rollback of executed actions, independent verification of
+results, and a signed audit log.
 
 ## License
 

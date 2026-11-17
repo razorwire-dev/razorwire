@@ -2,9 +2,10 @@
 
 Context for coding agents (Antigravity, Claude Code) working in this repo.
 
-The project is named **Razorwire** (chosen 2026-11-16). The name is not yet
-registered on GitHub, crates.io, npm or PyPI. The folder on disk is still
-called `agent-firewall`.
+The project is named **Razorwire** (chosen 2026-11-16). The code lives in the
+private GitHub repo `razorwire-dev/razorwire`; keep it private until launch.
+The name is not yet registered on crates.io, npm or PyPI. The folder on disk
+is still called `agent-firewall`.
 
 ## What this is
 
@@ -18,7 +19,7 @@ Open-source core (MIT), paid hosted control plane later.
 
 | Stage | Job | Status |
 |---|---|---|
-| 1. Policy | Block an action before it executes: scope, limits, blast radius | Working for non-streamed responses |
+| 1. Policy | Block an action before it executes: scope, limits, blast radius | Working, streamed and non-streamed |
 | 2. Sandbox | Shadow mode (log what would have happened) and rollback | Shadow mode works. Rollback not started |
 | 3. Verify | Check ground truth through a separate path, never the agent's own "done" | Not started |
 | 4. Attest | Tamper-evident, exportable log of every decision | Plain JSONL only, not signed |
@@ -32,8 +33,8 @@ Open-source core (MIT), paid hosted control plane later.
 - **The proxy is a security product.** No `unsafe`, no panics on bad input,
   never log API keys or `Authorization` headers.
 - **Fail closed.** Under an enforced policy, anything that cannot be checked is
-  blocked: a rule that errors, a tool call with no name, a response that
-  cannot be read, a streamed response.
+  blocked: a rule that errors, a tool call with no name, a response or a
+  stream that cannot be read.
 
 ## Where things are
 
@@ -43,6 +44,7 @@ Cargo.toml                   crate manifest
 src/main.rs                  the proxy: startup, forwarding, refusals
 src/policy.rs                policy files: load, validate, decide
 src/openai.rs                find tool calls in provider payloads, remove blocked ones
+src/sse.rs                   streamed replies: reassemble them, rebuild them after a block
 examples/demo_agent.rs       reckless agent that tries to drop two databases
 policy/policy.schema.json    JSON Schema for policy files
 policy/example.policy.yaml   example policy, also used by the unit tests
@@ -71,6 +73,18 @@ Both the Chat Completions shape (`tool_calls`, legacy `function_call`, custom
 tools) and the Responses API shape (`function_call`, `custom_tool_call`) are
 handled.
 
+### Streamed replies
+
+A streamed reply (`"stream": true`) spreads each tool call over many events.
+
+- **Policy enforced:** the whole stream is held back, reassembled into the
+  non-streamed shape, and checked by the same code. If nothing is blocked the
+  provider's original bytes are sent on unchanged. If something is blocked, a
+  rebuilt stream is sent with the blocked calls removed. Either way the agent
+  receives the reply in one burst when it is complete, not word by word.
+- **No policy, or shadow mode:** the stream passes through live and is read
+  on the side, so tool calls and decisions still reach the audit log.
+
 ## Policy files
 
 Format: `policy/policy.schema.json`. Example: `policy/example.policy.yaml`.
@@ -92,14 +106,19 @@ One JSON object per line in `audit.jsonl`:
 - `tool_call`: a tool call the model asked for. With a policy loaded it also
   carries `decision`, `rule`, `blocked`, and `reason` when not allowed.
 - `tool_result`: a tool result the agent sent back, logged once per call id.
-- `request_refused`, `response_refused`: the proxy refused to pass something on.
-- `stream_passthrough`: a streamed response went through uninspected.
+- `response_refused`: the proxy withheld a response it could not check.
 
 ## Known limits
 
-- **Streaming.** Under an enforced policy, requests with `"stream": true` are
-  refused with HTTP 400. With no policy or in shadow mode they pass through
-  and their tool calls are not seen.
+- **Streaming is delayed under enforcement.** The reply is held until it is
+  complete (up to 32 MB), so the agent loses word-by-word output.
+- **Rebuilt streams are minimal.** When a call is blocked, the rebuilt Chat
+  Completions stream carries the text and the remaining tool calls; other
+  streamed fields such as reasoning are dropped. The rebuilt Responses API
+  stream has only the start, item and final events, and has been tested
+  against a fake provider only, not against a real SDK.
+- **Not yet tested with real agent SDKs.** Verified with raw HTTP clients
+  against Groq, not with the OpenAI SDK, LangGraph or CrewAI.
 - **Coverage.** Only OpenAI-compatible payloads are understood. Tools the
   provider runs itself (web search, code interpreter) and the Responses API's
   computer and shell calls are not checked.
@@ -169,14 +188,14 @@ from the environment or from `.env`.
 
 | Weeks | Ship |
 |---|---|
-| 1-2 | Proxy intercepts and logs tool calls. Done. Public repo still to do |
+| 1-2 | Proxy intercepts and logs tool calls. Done. Repo is private until launch |
 | 3-4 | Policy engine: YAML rules that block an action, and the demo. Done |
 | 5-6 | Python SDK, LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
 | 7 | Rollback. Show HN launch |
 | 8 | Hosted control plane and Stripe billing |
 
-Next up, in order: inspect streamed responses, an approval flow for `review`,
-policy reload without a restart.
+Next up, in order: an approval flow for `review`, policy reload without a
+restart, testing with real agent SDKs, an easy install.
 
 ## Conventions
 

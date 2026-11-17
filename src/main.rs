@@ -8,6 +8,7 @@
 
 mod openai;
 mod policy;
+mod sse;
 
 use std::{
     collections::HashSet,
@@ -32,10 +33,15 @@ use axum::{
 use serde_json::{json, Value};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
 
+use futures_util::stream;
 use policy::{Mode, Policy};
+use sse::{Captured, StreamCapture};
 
 /// Largest request body the proxy accepts. Chat requests can carry images.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Largest streamed response that is held back to be checked.
+const MAX_STREAM_BYTES: usize = 32 * 1024 * 1024;
 
 /// How many tool-result ids are remembered before the set is reset.
 const MAX_SEEN_RESULTS: usize = 100_000;
@@ -196,24 +202,6 @@ async fn proxy(
         .to_string();
 
     let request_json: Option<Value> = serde_json::from_slice(&body).ok();
-    let wants_stream = request_json
-        .as_ref()
-        .and_then(|v| v.get("stream"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    // A streamed response is not inspected yet, so under an enforced policy it
-    // would be a way around every rule. Refuse it before it costs a request.
-    if wants_stream && state.enforcing() {
-        let message = "razorwire cannot check streamed responses against a policy yet. Send the request with \"stream\": false.";
-        state
-            .record(
-                request_id,
-                json!({ "event": "request_refused", "path": uri.path(), "reason": message }),
-            )
-            .await;
-        return refuse(StatusCode::BAD_REQUEST, "streaming_not_supported", message);
-    }
 
     if let Some(request) = &request_json {
         for (call_id, event) in openai::tool_results(request) {
@@ -264,16 +252,24 @@ async fn proxy(
         }
     }
 
-    let response_body = if wants_stream {
-        // Only reached when no policy is enforced. Streamed tool calls arrive
-        // in fragments; reassembling them is not built yet.
-        state
-            .record(
+    let response_body = if content_type(&response_headers).contains("event-stream") {
+        if state.enforcing() {
+            let policed = police_stream(
+                &state,
                 request_id,
-                json!({ "event": "stream_passthrough", "path": uri.path() }),
+                &agent,
+                uri.path(),
+                upstream,
+                &mut response_headers,
             )
             .await;
-        Body::from_stream(upstream.bytes_stream())
+            match policed {
+                Ok(body) => body,
+                Err(refusal) => return *refusal,
+            }
+        } else {
+            watch_stream(state.clone(), request_id, agent, upstream)
+        }
     } else {
         let bytes = match upstream.bytes().await {
             Ok(bytes) => bytes,
@@ -306,15 +302,13 @@ async fn proxy(
                 // calls but cannot be read is not passed on.
                 if state.enforcing() && !bytes.is_empty() && may_carry_tool_calls(&response_headers)
                 {
-                    let message =
-                        "razorwire could not read the provider's response, so it was not passed on.";
-                    state
-                        .record(
-                            request_id,
-                            json!({ "event": "response_refused", "path": uri.path(), "reason": message }),
-                        )
-                        .await;
-                    return refuse(StatusCode::BAD_GATEWAY, "response_not_inspectable", message);
+                    return refuse_response(
+                        &state,
+                        request_id,
+                        uri.path(),
+                        "the response is not readable JSON",
+                    )
+                    .await;
                 }
                 Body::from(bytes)
             }
@@ -327,17 +321,155 @@ async fn proxy(
     response
 }
 
-/// Whether an unreadable response could still be hiding tool calls: it claims
-/// to be JSON or an event stream, or it is compressed.
-fn may_carry_tool_calls(headers: &HeaderMap) -> bool {
-    let content_type = headers
+/// Under an enforced policy: hold the whole stream back, check it, then send
+/// either the original bytes or a rebuilt stream with the blocked calls
+/// removed. Nothing reaches the agent until the check is done.
+async fn police_stream(
+    state: &AppState,
+    request_id: u64,
+    agent: &str,
+    path: &str,
+    mut upstream: reqwest::Response,
+    headers: &mut HeaderMap,
+) -> Result<Body, Box<Response>> {
+    let mut capture = StreamCapture::default();
+    let mut original: Vec<u8> = Vec::new();
+    loop {
+        match upstream.chunk().await {
+            Ok(Some(chunk)) => {
+                if original.len() + chunk.len() > MAX_STREAM_BYTES {
+                    let reason = "the streamed response is too large to check";
+                    return Err(Box::new(
+                        refuse_response(state, request_id, path, reason).await,
+                    ));
+                }
+                capture.feed(&chunk);
+                original.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(err) => {
+                let message = format!("upstream response was cut short: {err}");
+                eprintln!("{message}");
+                return Err(Box::new(refuse(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_incomplete",
+                    &message,
+                )));
+            }
+        }
+    }
+
+    let (inspection, rebuilt) = match capture.finish() {
+        Captured::Nothing => return Ok(Body::from(original)),
+        Captured::Unreadable(reason) => {
+            return Err(Box::new(
+                refuse_response(state, request_id, path, reason).await,
+            ));
+        }
+        Captured::Chat(mut completion) => {
+            let inspection =
+                openai::inspect_response(&mut completion, state.policy.as_ref(), agent);
+            let rebuilt = (inspection.blocked > 0).then(|| sse::chat_stream(&completion));
+            (inspection, rebuilt)
+        }
+        Captured::Responses {
+            event,
+            mut response,
+        } => {
+            let inspection = openai::inspect_response(&mut response, state.policy.as_ref(), agent);
+            let rebuilt =
+                (inspection.blocked > 0).then(|| sse::responses_stream(&event, &response));
+            (inspection, rebuilt)
+        }
+    };
+
+    let blocked = inspection.blocked;
+    for event in inspection.events {
+        state.record(request_id, event).await;
+    }
+    match rebuilt {
+        None => Ok(Body::from(original)),
+        Some(stream) => {
+            headers.insert(
+                HeaderName::from_static("x-razorwire-blocked"),
+                HeaderValue::from(blocked),
+            );
+            Ok(Body::from(stream))
+        }
+    }
+}
+
+/// With no policy enforced: pass the stream on as it arrives, and read it on
+/// the side so its tool calls still reach the audit log.
+fn watch_stream(
+    state: Arc<AppState>,
+    request_id: u64,
+    agent: String,
+    upstream: reqwest::Response,
+) -> Body {
+    let stream = stream::unfold(
+        Some((upstream, StreamCapture::default())),
+        move |progress| {
+            let state = state.clone();
+            let agent = agent.clone();
+            async move {
+                let (mut upstream, mut capture) = progress?;
+                match upstream.chunk().await {
+                    Ok(Some(chunk)) => {
+                        capture.feed(&chunk);
+                        Some((Ok(chunk), Some((upstream, capture))))
+                    }
+                    Ok(None) => {
+                        let mut reply = match capture.finish() {
+                            Captured::Chat(completion) => completion,
+                            Captured::Responses { response, .. } => response,
+                            Captured::Unreadable(_) | Captured::Nothing => return None,
+                        };
+                        let inspection =
+                            openai::inspect_response(&mut reply, state.policy.as_ref(), &agent);
+                        for event in inspection.events {
+                            state.record(request_id, event).await;
+                        }
+                        None
+                    }
+                    Err(err) => Some((Err(err), None)),
+                }
+            }
+        },
+    );
+    Body::from_stream(stream)
+}
+
+/// Record that a response was withheld and build the error the agent gets.
+async fn refuse_response(state: &AppState, request_id: u64, path: &str, reason: &str) -> Response {
+    let message = format!(
+        "razorwire could not check the provider's response, so it was not passed on: {reason}."
+    );
+    state
+        .record(
+            request_id,
+            json!({ "event": "response_refused", "path": path, "reason": message }),
+        )
+        .await;
+    refuse(
+        StatusCode::BAD_GATEWAY,
+        "response_not_inspectable",
+        &message,
+    )
+}
+
+fn content_type(headers: &HeaderMap) -> String {
+    headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
-        .to_ascii_lowercase();
-    content_type.contains("json")
-        || content_type.contains("event-stream")
-        || headers.contains_key(header::CONTENT_ENCODING)
+        .to_ascii_lowercase()
+}
+
+/// Whether an unreadable response could still be hiding tool calls: it claims
+/// to be JSON, or it is compressed.
+fn may_carry_tool_calls(headers: &HeaderMap) -> bool {
+    content_type(headers).contains("json") || headers.contains_key(header::CONTENT_ENCODING)
 }
 
 /// An error produced by the proxy itself, in the shape OpenAI SDKs expect.

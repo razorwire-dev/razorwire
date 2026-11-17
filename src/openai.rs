@@ -263,7 +263,7 @@ pub fn tool_results(request: &Value) -> Vec<(Option<String>, Value)> {
 }
 
 /// The array at `key`, or an empty slice if it is missing or not an array.
-fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+pub(crate) fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
     value
         .get(key)
         .and_then(Value::as_array)
