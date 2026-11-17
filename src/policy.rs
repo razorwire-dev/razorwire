@@ -29,8 +29,8 @@ pub enum Action {
     #[default]
     Allow,
     Deny,
-    /// Hold for a human. There is no approval flow yet, so a held call is
-    /// blocked exactly like a denied one.
+    /// Hold for a human to approve or deny. With no one set up to approve, or
+    /// no decision in time, a held call is blocked like a denied one.
     Review,
 }
 

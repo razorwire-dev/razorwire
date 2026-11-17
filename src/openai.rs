@@ -19,7 +19,7 @@ const BLOCK_NOTE: &str = "[razorwire] Blocked tool call";
 /// request: the tool calls it received and how many calls were blocked.
 /// Agents resend the whole conversation every time, so the proxy needs no
 /// memory of its own to know where a run stands.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct History {
     /// Decoded arguments of every earlier call, by tool name.
     calls: HashMap<String, Vec<Value>>,
@@ -164,53 +164,182 @@ pub struct Inspection {
 /// Find every tool call in a provider response, record it, and remove the
 /// ones the policy blocks. Handles the Chat Completions and Responses API
 /// shapes. With no policy, calls are only recorded. `history` is the run
-/// before this response, read from the request.
+/// before this response, read from the request. A `review` decision blocks
+/// at once here; holding a call for a human goes through `plan` and `apply`.
 pub fn inspect_response(
     response: &mut Value,
     policy: Option<&Policy>,
     agent: &str,
     history: &History,
 ) -> Inspection {
-    let mut judge = Judge {
+    let plan = plan(response, policy, agent, history, false);
+    let blocked = apply(response, &plan);
+    Inspection {
+        events: plan.events,
+        blocked,
+    }
+}
+
+/// What happens to one tool call.
+enum Verdict {
+    Pass,
+    /// Removed, with this note left in its place.
+    Block(String),
+    /// Waiting for a human. The number is the index in `Plan::holds`.
+    Hold(usize),
+}
+
+/// A tool call held for a human decision.
+pub struct Hold {
+    pub tool: String,
+    pub arguments: Value,
+    pub call_id: Value,
+    pub rule: Option<String>,
+    pub message: String,
+    /// This call's entry in `Plan::events`.
+    pub event: usize,
+    /// Unset until decided. `Some(None)` lets the call through and
+    /// `Some(Some(note))` blocks it with that note.
+    outcome: Option<Option<String>>,
+}
+
+/// The policy's decisions for every tool call in one response, made before
+/// anything is changed so that held calls can wait for a human.
+pub struct Plan {
+    /// One audit event per tool call found.
+    pub events: Vec<Value>,
+    pub holds: Vec<Hold>,
+    verdicts: Vec<Verdict>,
+}
+
+impl Plan {
+    /// A human approved this held call: it goes through unchanged.
+    pub fn approve(&mut self, hold: usize) {
+        if let Some(hold) = self.holds.get_mut(hold) {
+            hold.outcome = Some(None);
+        }
+    }
+
+    /// This held call is blocked. `why` says what happened, for example who
+    /// denied it.
+    pub fn refuse(&mut self, hold: usize, why: &str) {
+        if let Some(hold) = self.holds.get_mut(hold) {
+            let message = format!("{} {why}", hold.message);
+            let note = block_note(Some(&hold.tool), &message, hold.rule.as_deref());
+            hold.outcome = Some(Some(note));
+        }
+    }
+}
+
+/// Decide every tool call in a response without changing it. With `holds`,
+/// a `review` decision under an enforced policy holds the call for a human
+/// instead of blocking it; otherwise it blocks at once.
+pub fn plan(
+    response: &mut Value,
+    policy: Option<&Policy>,
+    agent: &str,
+    history: &History,
+    holds: bool,
+) -> Plan {
+    let mut planner = Planner {
         policy,
         agent,
         model: response["model"].clone(),
         history,
         this_turn: History::default(),
-        events: Vec::new(),
-        blocked: 0,
+        holds,
+        plan: Plan {
+            events: Vec::new(),
+            holds: Vec::new(),
+            verdicts: Vec::new(),
+        },
     };
-    inspect_chat_completion(response, &mut judge);
-    inspect_responses_api(response, &mut judge);
-    Inspection {
-        events: judge.events,
-        blocked: judge.blocked,
-    }
+    visit(response, &mut planner);
+    planner.plan
 }
 
-struct Judge<'a> {
+/// Carry out a plan: remove the blocked calls, and the held calls that were
+/// not approved, leaving a note for each. Returns how many were removed. A
+/// held call nobody decided is blocked.
+pub fn apply(response: &mut Value, plan: &Plan) -> usize {
+    let mut applier = Applier {
+        verdicts: plan.verdicts.iter(),
+        holds: &plan.holds,
+        blocked: 0,
+    };
+    visit(response, &mut applier);
+    applier.blocked
+}
+
+/// The note left in place of a blocked call. It starts with `BLOCK_NOTE` so
+/// the loop guard can count it when the agent sends it back.
+fn block_note(tool: Option<&str>, message: &str, rule: Option<&str>) -> String {
+    let source = match rule {
+        Some(rule) => format!("rule: {rule}"),
+        None => "default policy".to_string(),
+    };
+    format!(
+        "{BLOCK_NOTE} \"{}\": {message} ({source})",
+        tool.unwrap_or("unnamed")
+    )
+}
+
+/// Something that looks at each tool call of a response in order.
+trait Visitor {
+    /// A new Chat Completions choice starts.
+    fn choice(&mut self);
+    /// One tool call. Returns the note to put in its place when it must be
+    /// removed, or `None` to keep it.
+    fn call(
+        &mut self,
+        api: &str,
+        call_id: &Value,
+        tool: Option<&str>,
+        arguments: &Value,
+    ) -> Option<String>;
+}
+
+struct Planner<'a> {
     policy: Option<&'a Policy>,
     agent: &'a str,
     model: Value,
     /// The run before this response.
     history: &'a History,
-    /// Calls passed on and calls blocked earlier in this response. They come
+    /// Calls passed on, blocked and held earlier in this response. They come
     /// before the call being judged, so they count toward the run too.
     this_turn: History,
-    events: Vec<Value>,
-    blocked: usize,
+    holds: bool,
+    plan: Plan,
 }
 
-impl Judge<'_> {
-    /// Record one tool call. Returns the note to show the agent when the call
-    /// must be removed, or `None` when it may go through.
-    fn judge(
+impl Visitor for Planner<'_> {
+    fn choice(&mut self) {
+        // Each choice is a separate answer to the same request, not a later
+        // step of the run, so earlier choices do not count toward it.
+        self.this_turn = History::default();
+    }
+
+    fn call(
         &mut self,
         api: &str,
         call_id: &Value,
         tool: Option<&str>,
         arguments: &Value,
     ) -> Option<String> {
+        let verdict = self.judge(api, call_id, tool, arguments);
+        self.plan.verdicts.push(verdict);
+        None
+    }
+}
+
+impl Planner<'_> {
+    fn judge(
+        &mut self,
+        api: &str,
+        call_id: &Value,
+        tool: Option<&str>,
+        arguments: &Value,
+    ) -> Verdict {
         let run = History::counts(self.history, &self.this_turn, tool, arguments);
         let mut event = json!({
             "event": "tool_call",
@@ -226,9 +355,9 @@ impl Judge<'_> {
         }
 
         let Some(policy) = self.policy else {
-            self.events.push(event);
+            self.plan.events.push(event);
             self.this_turn.add(tool, arguments.clone());
-            return None;
+            return Verdict::Pass;
         };
 
         let decision = match tool {
@@ -242,46 +371,122 @@ impl Judge<'_> {
                 error: None,
             },
         };
-        let blocked = !decision.is_allowed() && policy.mode() == Mode::Enforce;
+        let enforced = policy.mode() == Mode::Enforce;
+        let held = enforced && self.holds && decision.action == Action::Review;
+        let blocked = !decision.is_allowed() && enforced && !held;
 
         event["decision"] = json!(decision.action.as_str());
         event["rule"] = json!(decision.rule);
-        event["blocked"] = json!(blocked);
+        if held {
+            // The outcome is logged when a human decides.
+            event["held"] = json!(true);
+        } else {
+            event["blocked"] = json!(blocked);
+        }
         if !decision.is_allowed() {
             event["reason"] = json!(decision.message);
         }
         if let Some(error) = &decision.error {
             event["error"] = json!(error);
         }
-        self.events.push(event);
+        self.plan.events.push(event);
 
-        if !blocked {
-            self.this_turn.add(tool, arguments.clone());
-            return None;
+        match (tool, held, blocked) {
+            (Some(tool), true, _) => {
+                // A held call has not reached the agent, so later calls in
+                // this response count it as blocked, as they would a denial.
+                self.this_turn.blocked += 1;
+                self.plan.holds.push(Hold {
+                    tool: tool.to_string(),
+                    arguments: arguments.clone(),
+                    call_id: call_id.clone(),
+                    rule: decision.rule,
+                    message: decision.message,
+                    event: self.plan.events.len() - 1,
+                    outcome: None,
+                });
+                Verdict::Hold(self.plan.holds.len() - 1)
+            }
+            (_, false, false) => {
+                self.this_turn.add(tool, arguments.clone());
+                Verdict::Pass
+            }
+            _ => {
+                self.this_turn.blocked += 1;
+                Verdict::Block(block_note(
+                    tool,
+                    &decision.message,
+                    decision.rule.as_deref(),
+                ))
+            }
         }
-        self.blocked += 1;
-        self.this_turn.blocked += 1;
-        let source = match &decision.rule {
-            Some(rule) => format!("rule: {rule}"),
-            None => "default policy".to_string(),
-        };
-        Some(format!(
-            "{BLOCK_NOTE} \"{}\": {} ({source})",
-            tool.unwrap_or("unnamed"),
-            decision.message
-        ))
     }
 }
 
-fn inspect_chat_completion(response: &mut Value, judge: &mut Judge) {
+struct Applier<'a> {
+    verdicts: std::slice::Iter<'a, Verdict>,
+    holds: &'a [Hold],
+    blocked: usize,
+}
+
+impl Visitor for Applier<'_> {
+    fn choice(&mut self) {}
+
+    fn call(
+        &mut self,
+        _api: &str,
+        _call_id: &Value,
+        tool: Option<&str>,
+        _arguments: &Value,
+    ) -> Option<String> {
+        let note = match self.verdicts.next() {
+            Some(Verdict::Pass) => None,
+            Some(Verdict::Block(note)) => Some(note.clone()),
+            Some(Verdict::Hold(index)) => match self.holds.get(*index) {
+                Some(Hold {
+                    outcome: Some(outcome),
+                    ..
+                }) => outcome.clone(),
+                Some(hold) => Some(block_note(
+                    Some(&hold.tool),
+                    &format!("{} No decision was made, so it was blocked.", hold.message),
+                    hold.rule.as_deref(),
+                )),
+                None => Some(unmatched_note(tool)),
+            },
+            // The response has more calls than the plan: fail closed.
+            None => Some(unmatched_note(tool)),
+        };
+        if note.is_some() {
+            self.blocked += 1;
+        }
+        note
+    }
+}
+
+fn unmatched_note(tool: Option<&str>) -> String {
+    block_note(
+        tool,
+        "The call could not be matched to its policy decision, so it was blocked.",
+        None,
+    )
+}
+
+/// Walk every tool call in a response in a fixed order, and remove the ones
+/// the visitor returns a note for. Handles the Chat Completions and
+/// Responses API shapes.
+fn visit(response: &mut Value, visitor: &mut dyn Visitor) {
+    visit_chat_completion(response, visitor);
+    visit_responses_api(response, visitor);
+}
+
+fn visit_chat_completion(response: &mut Value, visitor: &mut dyn Visitor) {
     let Some(choices) = response.get_mut("choices").and_then(Value::as_array_mut) else {
         return;
     };
 
     for choice in choices {
-        // Each choice is a separate answer to the same request, not a later
-        // step of the run, so earlier choices do not count toward it.
-        judge.this_turn = History::default();
+        visitor.choice();
         let mut notes = Vec::new();
         let mut calls_remain = false;
 
@@ -291,7 +496,7 @@ fn inspect_chat_completion(response: &mut Value, judge: &mut Judge) {
                 for call in std::mem::take(calls) {
                     let (tool, arguments) = chat_call_parts(&call);
                     let note =
-                        judge.judge("chat.completions", &call["id"], tool.as_deref(), &arguments);
+                        visitor.call("chat.completions", &call["id"], tool.as_deref(), &arguments);
                     match note {
                         Some(note) => notes.push(note),
                         None => calls.push(call),
@@ -307,7 +512,7 @@ fn inspect_chat_completion(response: &mut Value, judge: &mut Judge) {
                 .map(|call| (named(&call["name"]), parse_arguments(&call["arguments"])));
             let mut function_call_remains = false;
             if let Some((tool, arguments)) = legacy {
-                let note = judge.judge(
+                let note = visitor.call(
                     "chat.completions",
                     &Value::Null,
                     tool.as_deref(),
@@ -347,22 +552,24 @@ fn inspect_chat_completion(response: &mut Value, judge: &mut Judge) {
     }
 }
 
-fn inspect_responses_api(response: &mut Value, judge: &mut Judge) {
+fn visit_responses_api(response: &mut Value, visitor: &mut dyn Visitor) {
     let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) else {
         return;
     };
 
+    let mut removed = 0;
     for item in output.iter_mut() {
         let (tool, arguments) = match item["type"].as_str() {
             Some("function_call") => (named(&item["name"]), parse_arguments(&item["arguments"])),
             Some("custom_tool_call") => (named(&item["name"]), item["input"].clone()),
             _ => continue,
         };
-        let note = judge.judge("responses", &item["call_id"], tool.as_deref(), &arguments);
+        let note = visitor.call("responses", &item["call_id"], tool.as_deref(), &arguments);
         if let Some(note) = note {
+            removed += 1;
             *item = json!({
                 "type": "message",
-                "id": format!("msg_blocked_{}", judge.blocked),
+                "id": format!("msg_blocked_{removed}"),
                 "role": "assistant",
                 "status": "completed",
                 "content": [{ "type": "output_text", "text": note, "annotations": [] }],
@@ -1035,5 +1242,137 @@ mod tests {
     fn keeps_arguments_that_are_not_json() {
         let raw = json!("not json");
         assert_eq!(parse_arguments(&raw), raw);
+    }
+
+    fn refund_call(id: &str, amount: u64) -> Value {
+        json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": "stripe_refund",
+                "arguments": json!({ "amount": amount }).to_string(),
+            }
+        })
+    }
+
+    /// Plan a response with holds allowed, as the proxy does when an
+    /// approver is set up.
+    fn plan_with_holds(response: &mut Value) -> Plan {
+        plan(
+            response,
+            Some(&example_policy()),
+            "support",
+            &History::default(),
+            true,
+        )
+    }
+
+    #[test]
+    fn a_review_call_is_held_without_changing_the_response() {
+        let mut response = chat_response(vec![refund_call("big", 47000), refund_call("small", 20)]);
+        let original = response.clone();
+
+        let plan = plan_with_holds(&mut response);
+
+        assert_eq!(response, original);
+        assert_eq!(plan.holds.len(), 1);
+        let hold = &plan.holds[0];
+        assert_eq!(hold.tool, "stripe_refund");
+        assert_eq!(hold.call_id, "big");
+        assert_eq!(hold.arguments["amount"], 47000);
+        assert_eq!(hold.rule.as_deref(), Some("refund-cap"));
+        let event = &plan.events[hold.event];
+        assert_eq!(event["decision"], "review");
+        assert_eq!(event["held"], true);
+        assert!(event.get("blocked").is_none());
+        assert_eq!(plan.events[1]["blocked"], false);
+    }
+
+    #[test]
+    fn an_approved_call_goes_through() {
+        let mut response = chat_response(vec![refund_call("big", 47000)]);
+        let original = response.clone();
+        let mut plan = plan_with_holds(&mut response);
+
+        plan.approve(0);
+        let blocked = apply(&mut response, &plan);
+
+        assert_eq!(blocked, 0);
+        assert_eq!(response, original);
+    }
+
+    #[test]
+    fn a_denied_call_is_removed_with_the_reason() {
+        let mut response = chat_response(vec![refund_call("big", 47000), refund_call("small", 20)]);
+        let mut plan = plan_with_holds(&mut response);
+
+        plan.refuse(0, "Denied by mann: wrong order.");
+        let blocked = apply(&mut response, &plan);
+
+        assert_eq!(blocked, 1);
+        let message = &response["choices"][0]["message"];
+        let calls = message["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "small");
+        let content = message["content"].as_str().unwrap();
+        assert!(content.starts_with(BLOCK_NOTE), "{content}");
+        assert!(
+            content.contains("Denied by mann: wrong order."),
+            "{content}"
+        );
+        assert!(content.contains("(rule: refund-cap)"), "{content}");
+    }
+
+    #[test]
+    fn a_hold_nobody_decided_is_blocked() {
+        let mut response = json!({
+            "object": "response",
+            "output": [{
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "stripe_refund",
+                "arguments": "{\"amount\":47000}"
+            }]
+        });
+        let plan = plan_with_holds(&mut response);
+
+        let blocked = apply(&mut response, &plan);
+
+        assert_eq!(blocked, 1);
+        assert_eq!(response["output"][0]["type"], "message");
+        assert!(response["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("No decision was made"));
+    }
+
+    #[test]
+    fn a_held_call_counts_as_blocked_for_the_calls_after_it() {
+        let mut response = chat_response(vec![refund_call("big", 47000), status_call("s", 1)]);
+        let plan = plan_with_holds(&mut response);
+        assert_eq!(plan.events[1]["run"]["blocked"], 1);
+        assert_eq!(plan.events[1]["run"]["calls"], 0);
+    }
+
+    #[test]
+    fn shadow_mode_never_holds() {
+        let mut response = chat_response(vec![refund_call("big", 47000)]);
+        let policy = shadow_policy();
+        let plan = plan(&mut response, Some(&policy), "", &History::default(), true);
+        assert!(plan.holds.is_empty());
+        assert_eq!(plan.events[0]["blocked"], false);
+    }
+
+    #[test]
+    fn a_plan_that_does_not_fit_the_response_fails_closed() {
+        let mut planned = chat_response(vec![]);
+        let plan = plan_with_holds(&mut planned);
+        let mut other = chat_response(vec![drop_call("c1", "staging")]);
+
+        assert_eq!(apply(&mut other, &plan), 1);
+        assert!(other["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("could not be matched"));
     }
 }

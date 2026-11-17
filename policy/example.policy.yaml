@@ -3,7 +3,8 @@
 #
 # In a `when` expression:
 #   args    the tool call's arguments
-#   agent   the name the agent sent in the `x-agent-name` header (empty if none)
+#   agent   the agent's name: from its key when agent keys are set up,
+#           otherwise from the `x-agent-name` header it sends (empty if none)
 #   run     what already happened in this run, counted from the conversation
 #           the agent sent:
 #             run.calls      tool calls the agent received so far
@@ -14,6 +15,10 @@
 #
 # A rule that applies to a call but cannot be evaluated (for example a missing
 # argument) blocks the call. Use has(args.field) for optional arguments.
+#
+# `review` holds a call until a human runs `razorwire approve` or
+# `razorwire deny`. With no admin key set up, or no decision in time, it
+# blocks the call like `deny`.
 
 version: 1
 mode: enforce      # switch to shadow to log decisions without blocking

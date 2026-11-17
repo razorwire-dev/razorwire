@@ -5,10 +5,12 @@ An action firewall for AI agents, written in Rust.
 Razorwire is a proxy that sits between an AI agent and its model provider.
 Every tool call the model asks for is checked against your rules. A call that
 breaks a rule is removed from the response before the agent receives it, so
-the agent has nothing to execute.
+the agent has nothing to execute. A risky call can be held until a human
+approves it. Every decision goes into an audit log that can be signed, so
+tampering shows.
 
 Status: early. It works for OpenAI-compatible APIs, streamed and
-non-streamed. See [Limits](#limits).
+non-streamed. See [Limits](#limits) and [SECURITY.md](SECURITY.md).
 
 ## The demo
 
@@ -130,6 +132,45 @@ top to bottom and the first match decides, so put an allow rule just above
   action: allow
 ```
 
+## Human approval
+
+A rule with `action: review` holds a tool call until a person decides. The
+agent waits; nothing reaches it until then.
+
+```yaml
+- id: refund-cap
+  match: { tool: stripe_refund }
+  when: args.amount > 500
+  action: review
+  message: Refunds above 500 are held for human approval.
+```
+
+From a live run against Groq, where a real model asked for a $750 refund:
+
+```
+$ razorwire approvals
+1 tool call is waiting for approval:
+
+  apr_b79940b196c10054ebcf413132bc8f62  stripe_refund  agent: support-bot  rule: refund-cap  1m 59s left
+      arguments: {"amount":750,"order":"A-17"}
+      why held:  Refunds above 500 are held for human approval.
+
+$ razorwire approve apr_b79940b196c10054ebcf413132bc8f62 checked with the customer
+Approved apr_b79940b196c10054ebcf413132bc8f62: stripe_refund for agent support-bot.
+```
+
+An approved call goes to the agent unchanged. A denied one is removed, and
+the agent is told who said no and why:
+
+```
+[razorwire] Blocked tool call "stripe_refund": Refunds above 500 are held for human approval. Denied by mann: already refunded last week. (rule: refund-cap)
+```
+
+If nobody decides within `APPROVAL_TIMEOUT_SECS` (default 300), or the
+agent hangs up, the call is blocked. Approving needs an admin key, and an
+agent's key can never approve, so an agent cannot wave its own calls
+through. With no admin key set up, `review` blocks at once.
+
 ## Run it
 
 You need [Rust](https://rustup.rs) and an API key for an OpenAI-compatible
@@ -167,12 +208,87 @@ from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8080/v1")
 ```
 
+It works the same from LangChain and LangGraph:
+
+```python
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI(model="openai/gpt-oss-120b", base_url="http://127.0.0.1:8080/v1")
+```
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `UPSTREAM_URL` | `https://api.openai.com` | Provider to forward to |
+| `UPSTREAM_URL` | `https://api.openai.com` | Provider to forward to. Must be https unless it is on this machine |
+| `UPSTREAM_API_KEY` | unset | Provider key the proxy sends, so agents never hold it |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Where the proxy listens |
 | `POLICY_FILE` | unset | Policy to load. Unset means log only |
+| `KEYS_FILE` | unset | Agent and admin keys. See [Lock it down](#lock-it-down) |
 | `AUDIT_LOG` | `audit.jsonl` | Where events are written |
+| `AUDIT_KEY` | unset | Signs the audit log so tampering shows |
+| `APPROVAL_TIMEOUT_SECS` | `300` | How long a held call waits for a human, 1 to 3600 |
+
+## Lock it down
+
+Out of the box Razorwire trusts any program on the same machine. Before
+other people or other machines can reach it, give every agent a key, keep
+the provider key inside the proxy, and sign the log.
+
+Install the `razorwire` command with `cargo install --path .`, or use
+`cargo run --release --` in its place.
+
+1. Create the keys. Each is shown once; the keys file keeps only its hash.
+
+   ```
+   razorwire new-key agent support-bot
+   razorwire new-key admin mann
+   razorwire new-audit-key
+   ```
+
+2. Start the proxy with them. The provider key goes to the proxy only.
+
+   ```
+   UPSTREAM_URL=https://api.groq.com/openai UPSTREAM_API_KEY=gsk_... \
+   POLICY_FILE=policy/example.policy.yaml KEYS_FILE=razorwire.keys AUDIT_KEY=<audit key> \
+   cargo run --release
+   ```
+
+3. Give each agent its own key as its API key. It cannot reach the
+   provider with it, only Razorwire.
+
+   ```python
+   client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="rw_...")
+   ```
+
+4. Approve and reload from your own terminal with the admin key.
+
+   ```
+   RAZORWIRE_ADMIN_KEY=rw_... razorwire approvals
+   ```
+
+With agent keys set up, a request without a valid key is refused with 401,
+and the agent's name in rules and in the log comes from its key, not from
+anything the agent says. Razorwire refuses to listen on a network address
+unless agent keys are set up. It speaks plain HTTP, so put a TLS proxy such
+as Caddy in front before keys cross a network. [SECURITY.md](SECURITY.md)
+lists what this protects against and what it does not.
+
+## Commands
+
+```
+razorwire                        start the proxy
+razorwire new-key <agent|admin> <name>
+razorwire new-audit-key
+razorwire check-policy <file>
+razorwire verify-log [file]
+razorwire approvals
+razorwire approve <id> [reason]
+razorwire deny <id> [reason]
+razorwire reload                 re-read the policy and keys files without a restart
+```
+
+The admin commands talk to `RAZORWIRE_URL` (default
+`http://127.0.0.1:8080`) with `RAZORWIRE_ADMIN_KEY`. A reload that finds an
+invalid file changes nothing and keeps the last good configuration.
 
 ## Policies
 
@@ -201,10 +317,13 @@ rules:
 
 - `match.tool` and `match.agent` accept `*` as a wildcard.
 - `when` is a [CEL](https://github.com/cel-expr/cel-spec) expression. `args`
-  is the tool call's arguments. `agent` is the `x-agent-name` request header.
+  is the tool call's arguments. `agent` is the agent's name: the name of its
+  key, or the `x-agent-name` request header when no agent keys are set up.
   `run` holds the [loop guard](#the-loop-guard) counts.
-- Actions are `allow`, `deny` and `review`. For now `review` blocks like `deny`.
+- Actions are `allow`, `deny` and `review`. `review` holds the call for
+  [human approval](#human-approval).
 - Start in `mode: shadow` to see what would be blocked before you enforce it.
+- Check a policy without starting the proxy: `razorwire check-policy <file>`.
 
 The full format is in [policy/policy.schema.json](policy/policy.schema.json).
 
@@ -215,7 +334,9 @@ When a policy is enforced, anything Razorwire cannot check is blocked:
 - a rule whose `when` cannot be evaluated for a call, such as a missing argument
 - a tool call with no name
 - a provider response that cannot be read
-- a policy file that is missing or invalid, which stops the proxy from starting
+- a held call nobody approved in time
+- a policy, keys or audit setting that is missing or invalid, which stops the
+  proxy from starting
 
 ## The audit log
 
@@ -226,30 +347,51 @@ object per line. A shortened example:
 {"event":"tool_call","tool":"db_drop","arguments":{"database":"production"},"run":{"calls":1,"same_tool":1,"repeats":0,"streak":0,"blocked":0},"decision":"deny","rule":"no-production-db-drop","blocked":true,"agent":"demo-agent"}
 ```
 
+Approvals, refused keys, reloads and startups are logged too. With
+`AUDIT_KEY` set, each line ends with a sequence number and an HMAC that
+covers the line before it, so a line that is edited, added, removed or moved
+breaks the chain:
+
+```
+$ razorwire verify-log audit.jsonl
+razorwire: audit.jsonl FAILED at line 4: the MAC does not match: seq jumps from 2 to 4, so lines are missing or out of order. The 3 signed lines before it are intact.
+```
+
+Text from the model is escaped in the log, so a tool argument cannot hide
+terminal control codes. Keys are never logged.
+
 ## Limits
 
 - **Streamed replies are delayed under enforcement.** To check a streamed
   reply, Razorwire holds it until it is complete, so the agent gets it in one
   burst instead of word by word. In shadow mode and with no policy, streams
   pass through live.
-- **Tested with one SDK so far.** Verified against Groq with raw HTTP clients
-  and with the official OpenAI Python SDK: Chat Completions and the Responses
-  API, streamed and not. Not yet tested with LangGraph or CrewAI.
+- **Tested with a few clients so far.** Verified against Groq with raw HTTP
+  clients, the official OpenAI Python SDK (Chat Completions and the Responses
+  API, streamed and not) and LangGraph through `langchain-openai` (plain and
+  streamed). Not yet tested with CrewAI.
 - **Loop counts come from the conversation the agent sends.** An agent that
   trims or rewrites its history starts its counts over. With the Responses
   API's `previous_response_id`, only the turns sent in the request are counted.
 - **OpenAI-compatible payloads only.** Chat Completions and the Responses API
   function and custom tool calls. Tools the provider runs itself are not checked.
 - **Only traffic through the proxy is protected.** An agent that can reach the
-  provider directly bypasses it.
-- **The agent name is self-declared.** `x-agent-name` is not authenticated.
-- **Policy changes need a restart.**
+  provider directly bypasses it. Keeping the provider key in
+  `UPSTREAM_API_KEY` means the agent has no key to do that with.
+- **Without agent keys, the agent name is self-declared.** `x-agent-name` is
+  taken at its word until you [set up keys](#lock-it-down).
+- **Approvals hold the whole response.** Other calls in the same response
+  wait with the held one. Pending approvals live in memory, so a restart
+  drops them, and the agent's request fails.
+- **No TLS of its own.** Put a TLS proxy in front for anything beyond this
+  machine.
+- **The log cannot show lines cut off its end.** Keep a copy elsewhere if
+  that matters. See [SECURITY.md](SECURITY.md).
 
 ## Roadmap
 
-An approval flow for `review`, policy reload, live streaming under
-enforcement, rollback of executed actions, independent verification of
-results, and a signed audit log.
+Live streaming under enforcement, rollback of executed actions, independent
+verification of results, an approvals dashboard, and an easier install.
 
 ## License
 

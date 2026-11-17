@@ -51,19 +51,19 @@
               "minLength": 1
             },
             "agent": {
-              "description": "Optional agent name, as sent in the `x-agent-name` header, same wildcard rules. Omit to match every agent.",
+              "description": "Optional agent name, same wildcard rules. With agent keys set up it is the name of the agent's key; without them it is the `x-agent-name` header the agent sends. Omit to match every agent.",
               "type": "string",
               "minLength": 1
             }
           }
         },
         "when": {
-          "description": "Optional CEL expression that must be true for the rule to fire. `args` is the tool call's arguments, `agent` is the name sent in the `x-agent-name` header, and `run` counts what already happened in this run, read from the conversation the agent sent: `run.calls`, `run.same_tool`, `run.repeats`, `run.streak` and `run.blocked`. Omit to fire on every matched call. If the expression cannot be evaluated for a matched call, the call is blocked.",
+          "description": "Optional CEL expression that must be true for the rule to fire. `args` is the tool call's arguments, `agent` is the agent's name (from its key, or from the `x-agent-name` header when no agent keys are set up), and `run` counts what already happened in this run, read from the conversation the agent sent: `run.calls`, `run.same_tool`, `run.repeats`, `run.streak` and `run.blocked`. Omit to fire on every matched call. If the expression cannot be evaluated for a matched call, the call is blocked.",
           "type": "string",
           "minLength": 1
         },
         "action": {
-          "description": "allow: run it. deny: block it and return `message` to the agent. review: hold it for a human. Until an approval flow exists, review blocks the call like deny.",
+          "description": "allow: run it. deny: block it and return `message` to the agent. review: hold it until a human approves or denies it with `razorwire approve` or `razorwire deny`. If no admin key is set up, or nobody decides within APPROVAL_TIMEOUT_SECS, review blocks the call like deny.",
           "enum": ["allow", "deny", "review"]
         },
         "message": {
