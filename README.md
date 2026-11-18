@@ -382,8 +382,7 @@ model = ChatOpenAI(model="openai/gpt-oss-120b", base_url="http://127.0.0.1:8080/
 ### The Python SDK
 
 [sdk/python](sdk/python) is a small package with no dependencies for the
-Python side of Razorwire. For now, install it from the repository:
-`pip install ./sdk/python`.
+Python side of Razorwire: `pip install razorwire`.
 
 ```python
 import razorwire

@@ -4,8 +4,8 @@ Context for coding agents (Antigravity, Claude Code) working in this repo.
 
 The project is named **Razorwire** (chosen 2026-11-16). The code lives in the
 private GitHub repo `razorwire-dev/razorwire`; keep it private until launch.
-The name is not yet registered on crates.io, npm or PyPI. The folder on disk
-is still called `agent-firewall`.
+The name is taken on PyPI (the Python SDK, 2026-11-18) but not yet on
+crates.io or npm. The folder on disk is still called `agent-firewall`.
 
 ## What this is
 
@@ -66,7 +66,7 @@ src/alerts.rs                alerts when a call is held: Slack, Discord, ntfy, j
 src/rollback.rs              the rollback plan, worked out from the audit log
 examples/demo_agent.rs       reckless agents: one drops databases, one gets stuck polling
 examples/executor.py         a starting point for an executor, standard library only
-sdk/python/                  the Python SDK (`razorwire` on PyPI, not published yet):
+sdk/python/                  the Python SDK (`razorwire` on PyPI):
                              agent helpers, block notes, admin client, executor,
                              signature checks, and a proxy runner for tests
 policy/policy.schema.json    JSON Schema for policy files
@@ -75,6 +75,7 @@ install.sh, install.ps1      one-command install from a GitHub release
 site/                        the public landing page: static HTML, CSS and a
                              little JS, no build step, not deployed yet
 .github/workflows/release.yml  release builds; runs only on a v* tag or by hand
+.github/workflows/pypi.yml   publishes the Python SDK to PyPI; runs only by hand
 ```
 
 ## How blocking works
@@ -482,14 +483,14 @@ without keys, so the demo proxy must not have agent keys set up.
 |---|---|
 | 1-2 | Proxy intercepts and logs tool calls. Done. Repo is private until launch |
 | 3-4 | Policy engine: YAML rules that block an action, and the demo. Done. Loop guard, approvals, keys, signed log and reload: done |
-| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; the SDK is not on PyPI yet. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
+| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; v0.1.0 released and the SDK is on PyPI. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
 | 7 | Rollback through an executor: done. Show HN launch |
 | 8 | Hosted control plane and Stripe billing |
 
-Next up, in order: cut the first release (`git tag v0.1.0`, push the tag),
-publish the Python SDK to PyPI (this claims the name; ask first),
-verification (stage 3), public-key signatures and export for the audit log
-(stage 4).
+Next up, in order: get ready to launch (put the site online, a demo clip,
+make the repository public, try the install scripts against the real
+release), launch, then verification (stage 3), public-key signatures and
+export for the audit log (stage 4).
 
 ## Releases
 
@@ -500,7 +501,15 @@ builds and tests on each platform, uploads `razorwire-<target>.tar.gz` (or
 with OpenSSL vendored (`--features vendored-openssl`). Publishing the draft
 is done by hand. `install.sh` and `install.ps1` download the latest release
 (or `RAZORWIRE_VERSION`), check it against `SHA256SUMS`, and need
-`GITHUB_TOKEN` while the repository is private.
+`GITHUB_TOKEN` while the repository is private. v0.1.0 was released on
+2026-11-18. To publish a draft by hand, open it from the releases list:
+`/releases/edit/<tag>` does not open a draft, it starts a new release.
+
+`.github/workflows/pypi.yml` publishes `sdk/python` to PyPI when started by
+hand. It checks that `pyproject.toml` and `_version.py` agree, runs the unit
+tests, builds, and uploads with PyPI's trusted publishing (publisher set up
+on pypi.org for this repository, `pypi.yml`, environment `pypi`), so no
+PyPI token exists. Raise the version first: PyPI never takes one twice.
 
 ## The public site
 
