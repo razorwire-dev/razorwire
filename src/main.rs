@@ -8,14 +8,17 @@ mod admin;
 mod approvals;
 mod audit;
 mod auth;
+mod executor;
 mod openai;
 mod policy;
 mod proxy;
+mod rollback;
 mod sse;
+mod tls;
 
 use std::{env, io::Write, net::SocketAddr, process, sync::Arc, time::Duration};
 
-use axum::{extract::DefaultBodyLimit, routing::get, Router};
+use axum::{extract::DefaultBodyLimit, routing::get, serve::ListenerExt, Router};
 use serde_json::json;
 
 use audit::Audit;
@@ -36,13 +39,20 @@ Usage:
   razorwire                        start the proxy (same as `razorwire serve`)
   razorwire new-key <agent|admin> <name>
                                    create a key and add its hash to the keys file
+  razorwire keys                   list the keys in the keys file
+  razorwire revoke-key <name> [fingerprint]
+                                   remove a key from the keys file
   razorwire new-audit-key          create a key for signing the audit log
   razorwire check-policy <file>    check a policy file and exit
   razorwire verify-log [file]      check that the audit log was not tampered with
-  razorwire approvals              list tool calls waiting for approval
-  razorwire approve <id> [reason]  let a held tool call through
-  razorwire deny <id> [reason]     block a held tool call
+  razorwire approvals              list tool calls waiting for approval, and parked ones
+  razorwire approve <id> [reason]  let a held tool call through, or run a parked one
+  razorwire deny <id> [reason]     block a held or parked tool call
   razorwire reload                 re-read the policy and keys files
+  razorwire rollback [--agent <name>] [--since <30m|2h|1d>] [<undo id>...] [--run]
+                                   show what agents did and how it would be undone;
+                                   with --run, undo it, newest first
+  razorwire new-executor-key       create a key for signing requests to the executor
 
 The proxy is configured with environment variables:
   UPSTREAM_URL            provider to forward to (default https://api.openai.com)
@@ -53,9 +63,15 @@ The proxy is configured with environment variables:
   AUDIT_LOG               audit log file (default audit.jsonl)
   AUDIT_KEY               signs the audit log so tampering shows
   APPROVAL_TIMEOUT_SECS   how long a held call waits for a human (default 300)
+  TLS_CERT, TLS_KEY       PEM certificate chain and PKCS#8 key: serve https
+  STREAM_MODE             live (default): streamed text goes out as it arrives;
+                          hold: the whole stream waits until it is checked
+  EXECUTOR_URL, EXECUTOR_KEY
+                          a service that carries out undos and parked calls;
+                          turns on rollback and approve-later
 
-The admin commands use RAZORWIRE_URL (default http://127.0.0.1:8080) and
-RAZORWIRE_ADMIN_KEY.
+The admin commands use RAZORWIRE_URL (default http://127.0.0.1:8080),
+RAZORWIRE_ADMIN_KEY, and RAZORWIRE_CA_CERT to trust a self-signed certificate.
 ";
 
 #[tokio::main]
@@ -64,7 +80,9 @@ async fn main() {
     let rest = args.get(1..).unwrap_or(&[]);
     let result = match args.first().map(String::as_str) {
         None | Some("serve") => serve().await,
-        Some("new-key") => new_key(rest),
+        Some("new-key") => new_key(rest).await,
+        Some("keys") => list_keys(rest),
+        Some("revoke-key") => revoke_key(rest).await,
         Some("new-audit-key") => new_audit_key(),
         Some("check-policy") => check_policy(rest),
         Some("verify-log") => verify_log(rest),
@@ -77,6 +95,8 @@ async fn main() {
             Ok(client) => client.reload().await,
             Err(err) => Err(err),
         },
+        Some("rollback") => rollback(rest).await,
+        Some("new-executor-key") => new_executor_key(),
         Some("help" | "--help" | "-h") => {
             print!("{HELP}");
             Ok(())
@@ -143,18 +163,35 @@ async fn serve() -> Result<(), String> {
     let loopback = listen.ip().is_loopback();
     proxy::check_exposure(loopback, &keys)?;
 
+    let live_streams = match setting("STREAM_MODE").as_deref().map(str::trim) {
+        None | Some("live") => true,
+        Some("hold") => false,
+        Some(_) => return Err("STREAM_MODE must be `live` or `hold`".into()),
+    };
+    let tls = match (setting("TLS_CERT"), setting("TLS_KEY")) {
+        (Some(cert), Some(key)) => Some(tls::acceptor(cert.trim(), key.trim())?),
+        (None, None) => None,
+        _ => return Err("set both TLS_CERT and TLS_KEY to serve https, or neither".into()),
+    };
+    let executor = match (setting("EXECUTOR_URL"), setting("EXECUTOR_KEY")) {
+        (Some(url), Some(key)) => Some(executor::Executor::new(&url, &key)?),
+        (None, None) => None,
+        _ => return Err("set both EXECUTOR_URL and EXECUTOR_KEY, or neither".into()),
+    };
+
     let audit = Arc::new(Audit::open(&audit_path, audit_key).await?);
     let signed = audit.signed().await;
     let agent_keys = keys.count(Role::Agent);
     let admin_keys = keys.count(Role::Admin);
 
     println!(
-        "razorwire {} listening on http://{listen}",
-        env!("CARGO_PKG_VERSION")
+        "razorwire {} listening on {}://{listen}",
+        env!("CARGO_PKG_VERSION"),
+        if tls.is_some() { "https" } else { "http" }
     );
-    if !loopback {
+    if !loopback && tls.is_none() {
         println!("  warning: this address is reachable from other machines over plain http.");
-        println!("           Put a TLS proxy (Caddy, nginx) in front, or keys and prompts travel unencrypted.");
+        println!("           Set TLS_CERT and TLS_KEY, or put a TLS proxy in front, or keys and prompts travel unencrypted.");
     }
     println!(
         "forwarding to {upstream} ({})",
@@ -171,7 +208,21 @@ async fn serve() -> Result<(), String> {
                 Mode::Shadow => "shadow: decisions are logged, nothing is blocked",
             };
             let path = policy_path.as_deref().unwrap_or("");
-            println!("policy: {path} ({} rules, {mode})", policy.rule_count());
+            println!(
+                "policy: {path} ({} rules, {} undo recipes, {mode})",
+                policy.rule_count(),
+                policy.undo_count()
+            );
+            if policy.mode() == Mode::Enforce {
+                println!(
+                    "  streamed replies: {}",
+                    if live_streams {
+                        "live. Text goes out as it arrives; tool calls wait for their check"
+                    } else {
+                        "held until the whole reply is checked (STREAM_MODE=hold)"
+                    }
+                );
+            }
         }
         None => println!("policy: none (tool calls are logged, nothing is blocked)"),
     }
@@ -189,6 +240,14 @@ async fn serve() -> Result<(), String> {
     } else {
         println!("  approvals: on. Held calls wait up to {approval_timeout} seconds for `razorwire approve`.");
     }
+    match &executor {
+        Some(executor) => println!(
+            "executor: {} (rollback can undo; a held call nobody decides in time is parked for {} days)",
+            executor.shown(),
+            approvals::PARK_FOR.as_secs() / 86_400
+        ),
+        None => println!("executor: none (rollback only shows its plan; held calls that time out are blocked)"),
+    }
     println!(
         "audit log: {audit_path} ({})",
         if signed {
@@ -205,10 +264,24 @@ async fn serve() -> Result<(), String> {
         policy_path,
         keys_path,
         approval_timeout: Duration::from_secs(approval_timeout),
+        live_streams,
     };
     let config = Config { policy, keys };
     let summary = config.summary();
-    let state = Arc::new(AppState::new(settings, config, audit)?);
+    let has_executor = executor.is_some();
+    let state = Arc::new(AppState::new(settings, config, audit, executor)?);
+    if has_executor {
+        // Calls parked before a restart can still be decided.
+        match state.audit.events().await {
+            Ok(events) => {
+                let parked = state.approvals.restore(&events);
+                if parked > 0 {
+                    println!("  parked calls: {parked} still waiting. See `razorwire approvals`.");
+                }
+            }
+            Err(err) => println!("  parked calls were not restored: {err}"),
+        }
+    }
     let started = json!({
         "event": "proxy_started",
         "version": env!("CARGO_PKG_VERSION"),
@@ -216,6 +289,8 @@ async fn serve() -> Result<(), String> {
         "upstream": upstream,
         "config": summary,
         "signed": signed,
+        "tls": tls.is_some(),
+        "executor": has_executor,
     });
     state.record(None, started).await;
 
@@ -229,19 +304,137 @@ async fn serve() -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|err| format!("cannot listen on {listen}: {err}"))?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .map_err(|err| format!("the server stopped: {err}"))
+    let served = match tls {
+        None => {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        }
+        Some(acceptor) => {
+            let listener = tls::TlsListener::new(listener, acceptor)
+                .map_err(|err| format!("cannot listen on {listen}: {err}"))?
+                // Gives the handlers the client's address, as plain TCP does.
+                .tap_io(|_| {});
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        }
+    };
+    served.map_err(|err| format!("the server stopped: {err}"))
 }
 
 async fn healthz() -> &'static str {
     "ok"
 }
 
-fn new_key(args: &[String]) -> Result<(), String> {
+fn keys_path() -> String {
+    setting("KEYS_FILE").unwrap_or_else(|| DEFAULT_KEYS_FILE.into())
+}
+
+/// The keys file's text, or nothing if it does not exist yet.
+fn read_keys_file(path: &str) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(format!(
+            "cannot read keys file {path}: {err} (it must be UTF-8 text)"
+        )),
+    }
+}
+
+/// Replace a file in one step, so a crash never leaves it half written. The
+/// new file keeps the old one's permissions.
+fn replace_file(path: &str, text: &str) -> Result<(), String> {
+    let temporary = format!("{path}.tmp-{}", process::id());
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            std::fs::set_permissions(&temporary, metadata.permissions())?;
+        }
+        std::fs::rename(&temporary, path)
+    };
+    write().map_err(|err| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("cannot write keys file {path}: {err}")
+    })
+}
+
+/// Ask the running proxy to re-read its files, when an admin key is at hand.
+/// `None` means no reload was tried.
+async fn reload_if_possible() -> Option<Result<(), String>> {
+    setting("RAZORWIRE_ADMIN_KEY")?;
+    Some(match admin::Client::from_env() {
+        Ok(client) => client.reload().await,
+        Err(err) => Err(err),
+    })
+}
+
+fn list_keys(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: razorwire keys".into());
+    }
+    let path = keys_path();
+    let keys = Keys::parse(&read_keys_file(&path)?).map_err(|err| format!("{path}: {err}"))?;
+    let listed = keys.listed();
+    if listed.is_empty() {
+        println!("{path} has no keys. Create one with `razorwire new-key <agent|admin> <name>`.");
+        return Ok(());
+    }
+    let width = listed.iter().map(|key| key.name.len()).max().unwrap_or(0);
+    println!("Keys in {path}:\n");
+    for key in &listed {
+        println!(
+            "  {:<5}  {:<width$}  {}",
+            key.role.as_str(),
+            key.name,
+            key.fingerprint
+        );
+    }
+    println!("\nThe last column is the start of the key's hash. Remove a key with `razorwire revoke-key <name>`.");
+    Ok(())
+}
+
+async fn revoke_key(args: &[String]) -> Result<(), String> {
+    let (name, fingerprint) = match args {
+        [name] => (name, None),
+        [name, fingerprint] => (name, Some(fingerprint.as_str())),
+        _ => return Err("usage: razorwire revoke-key <name> [fingerprint]".into()),
+    };
+    let path = keys_path();
+    let text = read_keys_file(&path)?;
+    let (kept, removed) =
+        auth::without_key(&text, name, fingerprint).map_err(|err| format!("{path}: {err}"))?;
+    replace_file(&path, &kept)?;
+    println!(
+        "Removed the {} key {} ({}) from {path}.",
+        removed.role.as_str(),
+        removed.name,
+        removed.fingerprint
+    );
+
+    let left = Keys::parse(&kept).map_err(|err| format!("{path}: {err}"))?;
+    if removed.role == Role::Admin && left.count(Role::Admin) == 0 {
+        println!("No admin keys are left, so after a reload `review` rules block at once.");
+    }
+    match reload_if_possible().await {
+        Some(Ok(())) => Ok(()),
+        Some(Err(err)) => Err(format!(
+            "the running Razorwire was not reloaded, so it still accepts that key: {err}"
+        )),
+        None => {
+            println!("The running Razorwire still accepts it until you run `razorwire reload` or restart it.");
+            Ok(())
+        }
+    }
+}
+
+async fn new_key(args: &[String]) -> Result<(), String> {
     let usage = "usage: razorwire new-key <agent|admin> <name>";
     let [role, name] = args else {
         return Err(usage.into());
@@ -250,18 +443,10 @@ fn new_key(args: &[String]) -> Result<(), String> {
     if !auth::valid_name(name) {
         return Err("the name must be 1 to 64 letters, digits, dots, dashes or underscores".into());
     }
-    let path = setting("KEYS_FILE").unwrap_or_else(|| DEFAULT_KEYS_FILE.into());
+    let path = keys_path();
 
     // Never add to a file that is already broken.
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => {
-            return Err(format!(
-                "cannot read keys file {path}: {err} (it must be UTF-8 text)"
-            ))
-        }
-    };
+    let existing = read_keys_file(&path)?;
     Keys::parse(&existing).map_err(|err| format!("{path}: {err}"))?;
 
     let key = auth::generate()?;
@@ -282,13 +467,23 @@ fn new_key(args: &[String]) -> Result<(), String> {
 
     let what = match role {
         Role::Agent => "Give it to the agent as its API key, or send it in the x-razorwire-key header.",
-        Role::Admin => "Set it as RAZORWIRE_ADMIN_KEY where you run `razorwire approve`. Never give it to an agent.",
+        Role::Admin => "Whoever holds it can approve and deny held calls, so hand it over privately and never \
+                        give it to an agent. They set it as RAZORWIRE_ADMIN_KEY where they run `razorwire approve`.",
     };
     println!("New {} key for {name}:\n", role.as_str());
     println!("    {key}\n");
     println!("It is shown only this once. {path} keeps only its hash.");
     println!("{what}");
-    println!("Start Razorwire with KEYS_FILE={path}, or run `razorwire reload` if it is running.");
+    println!("Remove it later with `razorwire revoke-key {name}`.");
+    match reload_if_possible().await {
+        Some(Ok(())) => {}
+        Some(Err(err)) => println!(
+            "The running Razorwire was not reloaded ({err}). Run `razorwire reload` once it is up."
+        ),
+        None => println!(
+            "Start Razorwire with KEYS_FILE={path}, or run `razorwire reload` if it is running."
+        ),
+    }
     Ok(())
 }
 
@@ -310,8 +505,70 @@ fn check_policy(args: &[String]) -> Result<(), String> {
         Mode::Enforce => "enforce",
         Mode::Shadow => "shadow",
     };
-    println!("{path}: ok, {} rules, mode {mode}", policy.rule_count());
+    println!(
+        "{path}: ok, {} rules, {} undo recipes, mode {mode}",
+        policy.rule_count(),
+        policy.undo_count()
+    );
     Ok(())
+}
+
+fn new_executor_key() -> Result<(), String> {
+    let key = audit::generate_key()?;
+    println!("{key}\n");
+    println!(
+        "Set EXECUTOR_KEY to this value for Razorwire, and give the same value to your executor,"
+    );
+    println!("which uses it to check that a request really came from Razorwire.");
+    println!("Keep it secret: anyone who has it can ask the executor to act.");
+    Ok(())
+}
+
+/// A span like `30m`, `2h`, `1d` or `90s`, in seconds.
+fn parse_span(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let split = text.find(|c: char| !c.is_ascii_digit())?;
+    let (number, unit) = text.split_at(split);
+    let number: u64 = number.parse().ok()?;
+    let unit = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return None,
+    };
+    number.checked_mul(unit)
+}
+
+async fn rollback(args: &[String]) -> Result<(), String> {
+    let usage =
+        "usage: razorwire rollback [--agent <name>] [--since <30m|2h|1d>] [<undo id>...] [--run]";
+    let mut filter = json!({});
+    let mut ids = Vec::new();
+    let mut run = false;
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--run" => run = true,
+            "--agent" => filter["agent"] = json!(words.next().ok_or(usage)?),
+            "--since" => {
+                let span = words.next().ok_or(usage)?;
+                let secs = parse_span(span).ok_or("--since takes a span like 30m, 2h or 1d")?;
+                filter["since_secs"] = json!(secs);
+            }
+            id if rollback::is_undo_id(id) => ids.push(id.to_string()),
+            _ => return Err(usage.into()),
+        }
+    }
+    if !ids.is_empty() {
+        filter["ids"] = json!(ids);
+    }
+    if filter.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Err(format!(
+            "say what to roll back: --agent, --since, or undo ids\n{usage}"
+        ));
+    }
+    admin::Client::from_env()?.rollback(filter, run).await
 }
 
 fn verify_log(args: &[String]) -> Result<(), String> {

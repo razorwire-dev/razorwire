@@ -1,0 +1,122 @@
+# Builds release binaries and attaches them to a draft GitHub release.
+#
+# Runs only when a version tag is pushed (git tag v0.2.0 && git push origin
+# v0.2.0) or when started by hand from the Actions tab with an existing tag.
+# Nothing runs on ordinary pushes, so no Actions minutes are used otherwise.
+# A run takes about 15 minutes of runner time; the macOS job counts ten
+# times against a private repository's free minutes.
+#
+# The release is left as a draft. Check it, then publish it on GitHub; the
+# install scripts only see published releases.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build, like v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  GH_TOKEN: ${{ github.token }}
+  CARGO_TERM_COLOR: never
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$TAG" ]; then
+            echo "Tag $TAG does not match version $version in Cargo.toml" >&2
+            exit 1
+          fi
+      - name: Create the draft release
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --title "Razorwire $TAG" --generate-notes
+          fi
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: x86_64-unknown-linux-musl
+            features: --features vendored-openssl
+          - os: macos-14
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+            features: ""
+          - os: windows-latest
+            targets: x86_64-pc-windows-msvc
+            features: ""
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Install the Rust targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          for target in ${{ matrix.targets }}; do rustup target add --toolchain stable "$target"; done
+      - name: Install musl
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools libssl-dev pkg-config
+      - name: Test
+        run: cargo +stable test --locked
+      - name: Build and package
+        run: |
+          mkdir -p dist
+          for target in ${{ matrix.targets }}; do
+            cargo +stable build --release --locked --target "$target" ${{ matrix.features }}
+            stage="razorwire-$target"
+            mkdir -p "$stage"
+            cp README.md LICENSE SECURITY.md "$stage/"
+            mkdir -p "$stage/policy" "$stage/examples"
+            cp policy/example.policy.yaml policy/policy.schema.json "$stage/policy/"
+            cp examples/executor.py "$stage/examples/"
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              cp "target/$target/release/razorwire.exe" "$stage/"
+              7z a -tzip "dist/$stage.zip" "$stage" >/dev/null
+            else
+              cp "target/$target/release/razorwire" "$stage/"
+              tar -czf "dist/$stage.tar.gz" "$stage"
+            fi
+          done
+          cd dist
+          for file in *; do
+            if command -v sha256sum >/dev/null; then sha256sum "$file"; else shasum -a 256 "$file"; fi > "$file.sha256"
+          done
+          ls -l
+      - name: Attach to the release
+        run: gh release upload "$TAG" dist/* --clobber
+
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect the checksums into SHA256SUMS
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sha256' --dir sums
+          cat sums/*.sha256 | sed 's/ \*/  /' | sort -k 2 > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          for file in sums/*.sha256; do
+            gh release delete-asset "$TAG" "$(basename "$file")" --repo "$GITHUB_REPOSITORY" --yes
+          done

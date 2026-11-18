@@ -70,6 +70,20 @@ rules:
     action: deny
     message: Dropping the production database is blocked by policy.
 
+  # Refunds in tiers, so a human is only asked about the ones in between:
+  #   up to 500       go through on their own (the default below allows them)
+  #   500 to 5,000    wait for a human
+  #   above 5,000     never done by an agent, approved or not
+  # and a run that keeps refunding is stopped from doing it on its own.
+
+  - id: refund-too-large
+    description: No agent refunds more than 5,000, even with approval.
+    match:
+      tool: stripe_refund
+    when: args.amount > 5000
+    action: deny
+    message: Refunds above 5,000 are never made by an agent. A person has to do it in Stripe.
+
   - id: refund-cap
     description: Refunds above 500 need a human.
     match:
@@ -78,6 +92,14 @@ rules:
     action: review
     message: Refunds above 500 are held for human approval.
 
+  - id: refund-spree
+    description: After three refunds in one run, the next ones need a human too.
+    match:
+      tool: stripe_refund
+    when: run.same_tool >= 3
+    action: review
+    message: This run has already made three refunds, so further ones are held for human approval.
+
   - id: email-allowlist
     description: Email only goes to our own domain.
     match:
@@ -85,3 +107,36 @@ rules:
     when: '!args.to.all(r, r.endsWith("@example.com"))'
     action: deny
     message: At least one recipient is outside the allowed domain.
+
+# How to reverse what an agent did, for `razorwire rollback`. Rollback reads
+# the audit log for calls that went through, works out the reversing call
+# from the recipe for that tool, and sends it to your executor (EXECUTOR_URL),
+# which holds the real credentials and carries it out. Newest first.
+#
+# In a recipe:
+#   args     the original call's arguments
+#   result   what the tool returned, as the agent reported it: decoded JSON
+#            if it was JSON, otherwise text, and null if nothing was reported
+#   agent    the agent's name
+# `when` (optional) says whether this call can be undone. Each value under
+# call.args is an expression; write text in inner quotes, as '"like this"'.
+# A tool with no recipe here, like db_drop, is listed as one that cannot be
+# undone.
+
+undo:
+  - tool: create_ticket
+    description: A ticket the agent opened is closed again.
+    when: has(result.id)
+    call:
+      tool: close_ticket
+      args:
+        id: result.id
+        comment: '"Closed by a Razorwire rollback."'
+
+  - tool: grant_role
+    description: A role the agent gave out is taken back.
+    call:
+      tool: revoke_role
+      args:
+        user: args.user
+        role: args.role

@@ -3,9 +3,13 @@
 //! The file format is described by `policy/policy.schema.json`. Rules are
 //! evaluated top to bottom and the first one that matches decides.
 
-use std::{collections::HashMap, collections::HashSet, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
-use cel::{Context, Env, Program, RuntimeOptions, Value as CelValue};
+use cel::{objects::Key, Context, Env, Program, RuntimeOptions, Value as CelValue};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -116,6 +120,45 @@ struct PolicyFile {
     #[serde(default, rename = "default")]
     default_action: Action,
     rules: Vec<RuleFile>,
+    #[serde(default)]
+    undo: Vec<UndoFile>,
+}
+
+/// How to reverse a call to one tool, for `razorwire rollback`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UndoFile {
+    tool: String,
+    #[serde(default)]
+    #[allow(dead_code)] // documentation for humans; not used by the engine
+    description: Option<String>,
+    #[serde(default)]
+    when: Option<String>,
+    call: UndoCallFile,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UndoCallFile {
+    tool: String,
+    /// Argument name to CEL expression.
+    #[serde(default)]
+    args: BTreeMap<String, String>,
+}
+
+struct Undo {
+    when: Option<Program>,
+    tool: String,
+    args: Vec<(String, Program)>,
+}
+
+/// How one call that went through can be reversed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UndoPlan {
+    /// The call that reverses it, for the executor to carry out.
+    Call { tool: String, arguments: Value },
+    /// It cannot be undone automatically, and why.
+    Unavailable(String),
 }
 
 #[derive(Deserialize)]
@@ -156,6 +199,8 @@ pub struct Policy {
     mode: Mode,
     default_action: Action,
     rules: Vec<Rule>,
+    /// Undo recipes by tool name.
+    undo: HashMap<String, Undo>,
     env: Arc<Env>,
 }
 
@@ -227,10 +272,56 @@ impl Policy {
             });
         }
 
+        let mut undo = HashMap::new();
+        for recipe in file.undo {
+            let tool = recipe.tool;
+            if tool.is_empty() || tool.contains('*') {
+                return Err(PolicyError(format!(
+                    "undo: tool {tool:?} must name one tool exactly, with no wildcard"
+                )));
+            }
+            if undo.contains_key(&tool) {
+                return Err(PolicyError(format!("undo: {tool} has two recipes")));
+            }
+            if recipe.call.tool.is_empty() {
+                return Err(PolicyError(format!("undo for {tool}: call.tool is empty")));
+            }
+            let when = match recipe.when {
+                None => None,
+                Some(source) if source.trim().is_empty() => {
+                    return Err(PolicyError(format!("undo for {tool}: when is empty")));
+                }
+                Some(source) => Some(env.compile(&source).map_err(|err| {
+                    PolicyError(format!("undo for {tool}: invalid when expression: {err}"))
+                })?),
+            };
+            let mut args = Vec::with_capacity(recipe.call.args.len());
+            for (name, source) in recipe.call.args {
+                if name.is_empty() || source.trim().is_empty() {
+                    return Err(PolicyError(format!(
+                        "undo for {tool}: call.args has an empty name or expression"
+                    )));
+                }
+                let program = env.compile(&source).map_err(|err| {
+                    PolicyError(format!(
+                        "undo for {tool}: invalid expression for call.args.{name}: {err}"
+                    ))
+                })?;
+                args.push((name, program));
+            }
+            let recipe = Undo {
+                when,
+                tool: recipe.call.tool,
+                args,
+            };
+            undo.insert(tool, recipe);
+        }
+
         Ok(Policy {
             mode: file.mode,
             default_action: file.default_action,
             rules,
+            undo,
             env,
         })
     }
@@ -241,6 +332,79 @@ impl Policy {
 
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    pub fn undo_count(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Work out how to reverse a call that went through, from the tool's
+    /// undo recipe. In the recipe, `args` is the call's arguments, `result`
+    /// what the agent reported the tool returned (null if nothing), and
+    /// `agent` the agent's name.
+    pub fn undo_for(
+        &self,
+        agent: &str,
+        tool: &str,
+        args: &Value,
+        result: Option<&Value>,
+    ) -> UndoPlan {
+        let Some(recipe) = self.undo.get(tool) else {
+            return UndoPlan::Unavailable(format!("the policy has no undo recipe for {tool}"));
+        };
+        let mut context = Context::with_env(self.env.clone());
+        context.add_variable_from_value("args", to_cel(args));
+        context.add_variable_from_value("agent", agent);
+        context.add_variable_from_value("result", result.map_or(CelValue::Null, to_cel));
+        let unavailable = |why: String| {
+            let note = if result.is_none() {
+                " (the agent reported no result for this call)"
+            } else {
+                ""
+            };
+            UndoPlan::Unavailable(format!("{why}{note}"))
+        };
+
+        if let Some(when) = &recipe.when {
+            match when.execute(&context) {
+                Ok(CelValue::Bool(true)) => {}
+                Ok(CelValue::Bool(false)) => {
+                    return unavailable(format!(
+                        "the undo recipe for {tool} says this call cannot be undone"
+                    ))
+                }
+                Ok(other) => {
+                    return unavailable(format!(
+                        "the undo recipe's when returned {other:?}, expected true or false"
+                    ))
+                }
+                Err(err) => {
+                    return unavailable(format!(
+                        "the undo recipe's when could not be evaluated: {err}"
+                    ))
+                }
+            }
+        }
+
+        let mut arguments = serde_json::Map::new();
+        for (name, program) in &recipe.args {
+            let value = match program.execute(&context) {
+                Ok(value) => from_cel(&value),
+                Err(err) => Err(err.to_string()),
+            };
+            match value {
+                Ok(value) => {
+                    arguments.insert(name.clone(), value);
+                }
+                Err(err) => {
+                    return unavailable(format!("call.args.{name} could not be worked out: {err}"))
+                }
+            }
+        }
+        UndoPlan::Call {
+            tool: recipe.tool.clone(),
+            arguments: Value::Object(arguments),
+        }
     }
 
     /// Decide what happens to one tool call. Fails closed: a rule that applies
@@ -350,6 +514,40 @@ fn to_cel(value: &Value) -> CelValue {
                 .collect::<HashMap<String, CelValue>>(),
         ),
     }
+}
+
+/// Convert the result of an undo expression into JSON for the executor.
+fn from_cel(value: &CelValue) -> Result<Value, String> {
+    Ok(match value {
+        CelValue::Null => Value::Null,
+        CelValue::Bool(flag) => json!(flag),
+        CelValue::Int(int) => json!(int),
+        CelValue::UInt(uint) => json!(uint),
+        CelValue::Float(float) => serde_json::Number::from_f64(*float)
+            .map(Value::Number)
+            .ok_or("it is a number that is not finite")?,
+        CelValue::String(text) => Value::String(text.to_string()),
+        CelValue::Bytes(bytes) => Value::String(
+            String::from_utf8(bytes.to_vec()).map_err(|_| "it is bytes that are not text")?,
+        ),
+        CelValue::List(items) => {
+            Value::Array(items.iter().map(from_cel).collect::<Result<_, _>>()?)
+        }
+        CelValue::Map(map) => {
+            let mut fields = serde_json::Map::new();
+            for (key, item) in map.map.iter() {
+                let name = match key {
+                    Key::String(text) => text.to_string(),
+                    Key::Int(int) => int.to_string(),
+                    Key::Uint(uint) => uint.to_string(),
+                    Key::Bool(flag) => flag.to_string(),
+                };
+                fields.insert(name, from_cel(item)?);
+            }
+            Value::Object(fields)
+        }
+        other => return Err(format!("{other:?} has no JSON form")),
+    })
 }
 
 fn is_valid_id(id: &str) -> bool {
@@ -555,7 +753,7 @@ rules:
     #[test]
     fn example_policy_holds_large_refunds() {
         let policy = policy(EXAMPLE);
-        let large = policy.check("", "stripe_refund", &json!({ "amount": 47000 }));
+        let large = policy.check("", "stripe_refund", &json!({ "amount": 4700 }));
         assert_eq!(large.action, Action::Review);
         assert_eq!(large.rule.as_deref(), Some("refund-cap"));
 
@@ -564,6 +762,25 @@ rules:
 
         let boundary = policy.check("", "stripe_refund", &json!({ "amount": 500 }));
         assert!(boundary.is_allowed());
+    }
+
+    #[test]
+    fn example_policy_puts_refunds_in_tiers() {
+        let policy = policy(EXAMPLE);
+        let huge = policy.check("", "stripe_refund", &json!({ "amount": 47000 }));
+        assert_eq!(huge.action, Action::Deny);
+        assert_eq!(huge.rule.as_deref(), Some("refund-too-large"));
+
+        let top = policy.check("", "stripe_refund", &json!({ "amount": 5000 }));
+        assert_eq!(top.action, Action::Review);
+
+        // Small refunds pass, until a run has made three of them.
+        let after = |refunds| run(refunds, refunds, 0, 0, 0);
+        let third = policy.decide("", "stripe_refund", &json!({ "amount": 20 }), &after(2));
+        assert!(third.is_allowed());
+        let fourth = policy.decide("", "stripe_refund", &json!({ "amount": 20 }), &after(3));
+        assert_eq!(fourth.action, Action::Review);
+        assert_eq!(fourth.rule.as_deref(), Some("refund-spree"));
     }
 
     #[test]
@@ -796,5 +1013,128 @@ rules:
                 ),
             }
         }
+    }
+
+    #[test]
+    fn undo_recipes_work_out_the_reversing_call() {
+        let policy = policy(EXAMPLE);
+        assert_eq!(policy.undo_count(), 2);
+
+        // From the tool's result.
+        let created = json!({ "id": 812, "url": "https://tickets/812" });
+        assert_eq!(
+            policy.undo_for(
+                "support-bot",
+                "create_ticket",
+                &json!({ "title": "x" }),
+                Some(&created)
+            ),
+            UndoPlan::Call {
+                tool: "close_ticket".into(),
+                arguments: json!({ "id": 812, "comment": "Closed by a Razorwire rollback." }),
+            }
+        );
+        // From the call's arguments.
+        assert_eq!(
+            policy.undo_for(
+                "a",
+                "grant_role",
+                &json!({ "user": "u1", "role": "admin" }),
+                None
+            ),
+            UndoPlan::Call {
+                tool: "revoke_role".into(),
+                arguments: json!({ "user": "u1", "role": "admin" }),
+            }
+        );
+    }
+
+    #[test]
+    fn some_calls_cannot_be_undone_and_say_why() {
+        let policy = policy(EXAMPLE);
+        let why = |plan: UndoPlan| match plan {
+            UndoPlan::Unavailable(why) => why,
+            call => panic!("expected no undo, got {call:?}"),
+        };
+        let no_recipe = why(policy.undo_for(
+            "a",
+            "db_drop",
+            &json!({ "database": "staging" }),
+            Some(&json!("ok")),
+        ));
+        assert!(
+            no_recipe.contains("no undo recipe for db_drop"),
+            "{no_recipe}"
+        );
+
+        // The ticket tool failed, so there is no id to close.
+        let failed = why(policy.undo_for(
+            "a",
+            "create_ticket",
+            &json!({}),
+            Some(&json!({ "error": "quota" })),
+        ));
+        assert!(failed.contains("cannot be undone"), "{failed}");
+
+        let unreported = why(policy.undo_for("a", "create_ticket", &json!({}), None));
+        assert!(unreported.contains("reported no result"), "{unreported}");
+    }
+
+    #[test]
+    fn bad_undo_recipes_are_rejected() {
+        let rule = "version: 1\nrules: []\n";
+        let cases = [
+            (
+                "undo:\n  - tool: \"db_*\"\n    call: { tool: x }\n",
+                "wildcard",
+            ),
+            (
+                "undo:\n  - tool: a\n    call: { tool: x }\n  - tool: a\n    call: { tool: y }\n",
+                "two recipes",
+            ),
+            (
+                "undo:\n  - tool: a\n    call: { tool: \"\" }\n",
+                "call.tool",
+            ),
+            (
+                "undo:\n  - tool: a\n    call:\n      tool: x\n      args: { id: \"result.\" }\n",
+                "call.args.id",
+            ),
+            (
+                "undo:\n  - tool: a\n    when: \"(\"\n    call: { tool: x }\n",
+                "when",
+            ),
+            (
+                "undo:\n  - tool: a\n    call: { tool: x, typo: 1 }\n",
+                "typo",
+            ),
+        ];
+        for (undo, expected) in cases {
+            let text = format!("{rule}{undo}");
+            match Policy::parse(&text) {
+                Ok(_) => panic!("policy should be rejected:\n{text}"),
+                Err(err) => assert!(
+                    err.to_string().contains(expected),
+                    "error {:?} should mention {expected:?}",
+                    err.to_string()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn undo_values_become_json() {
+        let text = "version: 1\nrules: []\nundo:\n  - tool: t\n    call:\n      tool: u\n      args:\n        list: '[1, \"two\", 3.5, null, true]'\n        map: '{\"k\": args.n, 7: \"seven\"}'\n";
+        let policy = policy(text);
+        assert_eq!(
+            policy.undo_for("a", "t", &json!({ "n": 5 }), None),
+            UndoPlan::Call {
+                tool: "u".into(),
+                arguments: json!({
+                    "list": [1, "two", 3.5, null, true],
+                    "map": { "k": 5, "7": "seven" },
+                }),
+            }
+        );
     }
 }

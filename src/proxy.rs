@@ -8,7 +8,10 @@
 
 use std::{
     collections::HashSet,
+    convert::Infallible,
+    future::Future,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex, PoisonError, RwLock,
@@ -30,6 +33,7 @@ use crate::{
     approvals::{Approvals, HoldError, Outcome},
     audit::{now_ms, Audit},
     auth::{self, Keys, Role},
+    executor::Executor,
     openai,
     policy::{Mode, Policy},
     sse::{self, Captured, StreamCapture},
@@ -99,6 +103,10 @@ pub struct Settings {
     pub policy_path: Option<String>,
     pub keys_path: Option<String>,
     pub approval_timeout: Duration,
+    /// Under an enforced policy, send a streamed reply's text on as it
+    /// arrives and hold back only from the first tool call. Off, the whole
+    /// stream is held until it has been checked.
+    pub live_streams: bool,
 }
 
 /// What `razorwire reload` can change.
@@ -112,6 +120,7 @@ impl Config {
         json!({
             "policy": self.policy.as_ref().map(|policy| json!({
                 "rules": policy.rule_count(),
+                "undo": policy.undo_count(),
                 "mode": match policy.mode() { Mode::Enforce => "enforce", Mode::Shadow => "shadow" },
             })),
             "agent_keys": self.keys.count(Role::Agent),
@@ -133,6 +142,10 @@ pub struct AppState {
     config: RwLock<Arc<Config>>,
     pub audit: Arc<Audit>,
     pub approvals: Approvals,
+    /// Carries out undos and parked calls. `None` if none is set up.
+    pub executor: Option<Executor>,
+    /// One rollback runs at a time.
+    pub rollback_lock: Mutex<()>,
     /// Tool results already recorded. Agents resend the whole conversation on
     /// every request, so without this each result would be logged many times.
     seen_results: Mutex<HashSet<String>>,
@@ -142,7 +155,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(settings: Settings, config: Config, audit: Arc<Audit>) -> Result<AppState, String> {
+    pub fn new(
+        settings: Settings,
+        config: Config,
+        audit: Arc<Audit>,
+        executor: Option<Executor>,
+    ) -> Result<AppState, String> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(UPSTREAM_READ_TIMEOUT)
@@ -155,8 +173,10 @@ impl AppState {
             client,
             settings,
             config: RwLock::new(Arc::new(config)),
-            approvals: Approvals::new(MAX_PENDING_APPROVALS, audit.clone()),
+            approvals: Approvals::new(MAX_PENDING_APPROVALS, audit.clone(), executor.is_some()),
             audit,
+            executor,
+            rollback_lock: Mutex::new(()),
             seen_results: Mutex::new(HashSet::new()),
             next_request_id: AtomicU64::new(1),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -339,14 +359,19 @@ pub async fn forward(
     // here so the parsed request is not held while the provider answers.
     let history = match serde_json::from_slice::<Value>(&body) {
         Ok(request) => {
-            for (call_id, event) in openai::tool_results(&request) {
+            for (call_id, mut event) in openai::tool_results(&request) {
+                // Call ids are only unique per agent, so results are told
+                // apart by both. Rollback pairs a result with its call.
+                if !agent.is_empty() {
+                    event["agent"] = json!(agent);
+                }
                 let is_new = match call_id {
                     Some(id) => {
                         let mut seen = state.seen_results.lock().await;
                         if seen.len() >= MAX_SEEN_RESULTS {
                             seen.clear();
                         }
-                        seen.insert(id)
+                        seen.insert(format!("{agent}\n{id}"))
                     }
                     None => true,
                 };
@@ -389,9 +414,10 @@ pub async fn forward(
     }
 
     let policy = config.policy.clone();
-    let enforced = policy
-        .as_deref()
+    let enforced_policy = policy
+        .clone()
         .filter(|policy| policy.mode() == Mode::Enforce);
+    let enforced = enforced_policy.as_deref();
     // Calls can only be held when someone is able to approve them.
     let holds = config.keys.count(Role::Admin) > 0;
     let job = Job {
@@ -403,9 +429,23 @@ pub async fn forward(
     };
 
     let response_body = if content_type(&response_headers).contains("event-stream") {
-        match enforced {
+        match enforced_policy {
+            Some(policy) if state.settings.live_streams => police_live(Live {
+                state: state.clone(),
+                request_id,
+                agent: agent.clone(),
+                history: history.clone(),
+                policy,
+                holds,
+                path: uri.path().to_string(),
+                upstream,
+                gate: sse::LiveGate::default(),
+                read: 0,
+                _permit: permit,
+            }),
             Some(policy) => {
-                match police_stream(&job, policy, uri.path(), upstream, &mut response_headers).await
+                match police_stream(&job, &policy, uri.path(), upstream, &mut response_headers)
+                    .await
                 {
                     Ok(body) => body,
                     Err(refusal) => return *refusal,
@@ -674,6 +714,15 @@ async fn police(job: &Job<'_>, policy: &Policy, response: &mut Value) -> usize {
                 plan.refuse(index, &why);
                 ("expired", None, None)
             }
+            Outcome::Parked => {
+                let why = format!(
+                    "No one approved it within {} seconds, so it is parked. If a person approves it \
+                     later, Razorwire carries it out itself, so do not try it again.",
+                    timeout.as_secs()
+                );
+                plan.refuse(index, &why);
+                ("parked", None, None)
+            }
         };
         let event = json!({
             "event": "approval_decided",
@@ -763,6 +812,138 @@ async fn police_stream(
             );
             Ok(Body::from(stream))
         }
+    }
+}
+
+/// A streamed reply being policed live.
+struct Live {
+    state: Arc<AppState>,
+    request_id: u64,
+    agent: String,
+    history: openai::History,
+    policy: Arc<Policy>,
+    holds: bool,
+    path: String,
+    upstream: reqwest::Response,
+    gate: sse::LiveGate,
+    /// Bytes read from the provider so far.
+    read: usize,
+    /// The request's slot, held until the stream ends.
+    _permit: OwnedSemaphorePermit,
+}
+
+/// While a streamed reply waits for a human, this comment is sent every
+/// `HEARTBEAT`. Clients skip comments. It keeps idle connections open, and
+/// writing to an agent that hung up fails, which withdraws its held calls.
+const HEARTBEAT: Duration = Duration::from_secs(5);
+const HEARTBEAT_LINE: &[u8] = b": razorwire is waiting for a decision\n\n";
+
+/// The check of a finished stream, which may wait for a human.
+type Checking = Pin<Box<dyn Future<Output = Vec<u8>> + Send>>;
+
+enum Phase {
+    Reading(Box<Live>),
+    Checking(Checking),
+}
+
+impl Live {
+    /// The stream is complete: check it, wait for a human on held calls,
+    /// and return what is left to send. The request's slot goes with it.
+    async fn finish(mut self) -> Vec<u8> {
+        let responses = self.gate.is_responses();
+        let (captured, held, sent) = std::mem::take(&mut self.gate).finish();
+        let job = Job {
+            state: &self.state,
+            request_id: self.request_id,
+            agent: &self.agent,
+            history: &self.history,
+            holds: self.holds,
+        };
+        match captured {
+            Captured::Nothing => held,
+            Captured::Unreadable(reason) => self.refuse(reason, responses).await,
+            Captured::Chat(mut completion) => {
+                if police(&job, &self.policy, &mut completion).await == 0 {
+                    held
+                } else {
+                    sse::chat_tail(&completion, &sent).into_bytes()
+                }
+            }
+            Captured::Responses {
+                event,
+                mut response,
+            } => {
+                if police(&job, &self.policy, &mut response).await == 0 {
+                    held
+                } else {
+                    sse::responses_tail(&event, &response, &sent).into_bytes()
+                }
+            }
+        }
+    }
+
+    /// End the stream with an error instead of the rest of the reply. What
+    /// was already sent was only text, so no tool call got through.
+    async fn refuse(&self, reason: &str, responses: bool) -> Vec<u8> {
+        let message = format!(
+            "razorwire could not check the provider's response, so the rest of it was not passed on: {reason}."
+        );
+        let event = json!({ "event": "response_refused", "path": self.path, "reason": message });
+        self.state.record(Some(self.request_id), event).await;
+        sse::stream_error(responses, "response_not_inspectable", &message).into_bytes()
+    }
+}
+
+/// Under an enforced policy, with live streaming: pass the reply on as it
+/// arrives while it is only text, and hold everything from the first event
+/// that could carry a tool call until the whole reply is checked. Then send
+/// the held part unchanged, or rebuilt without the blocked calls. A tool
+/// call never reaches the agent before its decision. If the agent hangs up,
+/// the stream is dropped, and with it any held approval.
+fn police_live(live: Live) -> Body {
+    let start = Some(Phase::Reading(Box::new(live)));
+    let stream = stream::unfold(start, |phase| async move {
+        let mut live = match phase? {
+            Phase::Reading(live) => live,
+            Phase::Checking(checking) => return check_step(checking).await,
+        };
+        loop {
+            let responses = live.gate.is_responses();
+            match live.upstream.chunk().await {
+                Ok(Some(chunk)) => {
+                    live.read = live.read.saturating_add(chunk.len());
+                    if live.read > MAX_STREAM_BYTES {
+                        let end = live
+                            .refuse("the streamed response is too large to check", responses)
+                            .await;
+                        return Some((Ok(Bytes::from(end)), None));
+                    }
+                    let ready = live.gate.feed(&chunk);
+                    if !ready.is_empty() {
+                        return Some((Ok(Bytes::from(ready)), Some(Phase::Reading(live))));
+                    }
+                }
+                Ok(None) => return check_step(Box::pin(live.finish())).await,
+                Err(err) => {
+                    eprintln!("razorwire: upstream response was cut short: {err}");
+                    let reason = format!("the provider's stream was cut short: {err}");
+                    let end = live.refuse(&reason, responses).await;
+                    return Some((Ok(Bytes::from(end)), None));
+                }
+            }
+        }
+    });
+    Body::from_stream(stream)
+}
+
+/// Wait for the check to end, sending a heartbeat comment meanwhile.
+async fn check_step(mut checking: Checking) -> Option<(Result<Bytes, Infallible>, Option<Phase>)> {
+    tokio::select! {
+        end = &mut checking => Some((Ok(Bytes::from(end)), None)),
+        () = tokio::time::sleep(HEARTBEAT) => Some((
+            Ok(Bytes::from_static(HEARTBEAT_LINE)),
+            Some(Phase::Checking(checking)),
+        )),
     }
 }
 

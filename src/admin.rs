@@ -16,14 +16,20 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::{
-    approvals::{clean_reason, Verdict},
+    approvals::{clean_reason, Parked, Verdict},
     audit::{json_line, now_ms},
     auth::{self, Role},
+    policy::UndoPlan,
     proxy::{is_loopback_host, json_response, refuse, refuse_unauthorized, AppState},
+    rollback::{self, Filter},
 };
 
-/// Largest admin request body. A reason is all an admin request carries.
+/// Largest admin request body. A reason or a list of undo ids is all an
+/// admin request carries.
 const MAX_ADMIN_BODY_BYTES: usize = 16 * 1024;
+
+const NO_EXECUTOR: &str = "No executor is set up, so Razorwire cannot carry out actions itself. \
+     Run one (see examples/executor.py), set EXECUTOR_URL and EXECUTOR_KEY, and restart Razorwire.";
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -31,6 +37,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/razorwire/approvals/{id}/approve", post(approve))
         .route("/razorwire/approvals/{id}/deny", post(deny))
         .route("/razorwire/reload", post(reload))
+        .route("/razorwire/rollback", post(rollback))
         .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES))
 }
 
@@ -88,7 +95,11 @@ async fn list_approvals(
     if let Err(refusal) = admin(&state, peer, "/razorwire/approvals", &headers).await {
         return *refusal;
     }
-    reply(json!({ "now_ms": now_ms(), "pending": state.approvals.list() }))
+    reply(json!({
+        "now_ms": now_ms(),
+        "pending": state.approvals.list(),
+        "parked": state.approvals.list_parked(),
+    }))
 }
 
 async fn approve(
@@ -132,21 +143,250 @@ async fn decide(
         by: by.clone(),
         reason: reason.clone(),
     };
-    match state.approvals.decide(id, verdict) {
-        Some(summary) => reply(json!({
+    if let Some(summary) = state.approvals.decide(id, verdict.clone()) {
+        return reply(json!({
             "approval_id": id,
             "decision": if approved { "approved" } else { "denied" },
             "by": by,
             "reason": reason,
             "agent": summary["agent"],
             "tool": summary["tool"],
-        })),
+        }));
+    }
+    match state.approvals.take_parked(id) {
+        Some(call) => decide_parked(state, id, call, verdict).await,
         None => refuse(
             StatusCode::NOT_FOUND,
             "not_pending",
             "No tool call is waiting under that id. It may have been decided already, or it timed out.",
         ),
     }
+}
+
+/// Decide a parked call. Its agent is gone, so an approved one is carried
+/// out by the executor. If that fails, the call stays parked.
+async fn decide_parked(state: &AppState, id: &str, call: Parked, verdict: Verdict) -> Response {
+    let Verdict {
+        approved,
+        by,
+        reason,
+    } = verdict;
+    let mut answer = json!({
+        "approval_id": id,
+        "decision": if approved { "approved" } else { "denied" },
+        "by": by,
+        "reason": reason,
+        "agent": call.summary["agent"],
+        "tool": call.summary["tool"],
+        "parked": true,
+    });
+    let decided = json!({
+        "event": "approval_decided",
+        "approval_id": id,
+        "decision": if approved { "approved" } else { "denied" },
+        "by": by,
+        "reason": reason,
+        "parked": true,
+        "blocked": !approved,
+    });
+    if !approved {
+        state.record(None, decided).await;
+        return reply(answer);
+    }
+    let Some(executor) = &state.executor else {
+        state.approvals.put_back(id, call);
+        return refuse(StatusCode::CONFLICT, "no_executor", NO_EXECUTOR);
+    };
+    state.record(None, decided).await;
+    let job = json!({
+        "kind": "call",
+        "id": id,
+        "agent": call.summary["agent"],
+        "tool": call.summary["tool"],
+        "call_id": call.summary["call_id"],
+        "arguments": call.arguments,
+        "approved_by": by,
+        "reason": reason,
+    });
+    match executor.run(&job).await {
+        Ok(output) => {
+            let event = json!({
+                "event": "parked_call_ran",
+                "approval_id": id,
+                "by": by,
+                "tool": call.summary["tool"],
+                "output": output,
+            });
+            state.record(None, event).await;
+            answer["ran"] = json!(true);
+            answer["output"] = output;
+            reply(answer)
+        }
+        Err(error) => {
+            state.approvals.put_back(id, call);
+            let event = json!({
+                "event": "parked_call_failed",
+                "approval_id": id,
+                "by": by,
+                "error": error,
+            });
+            state.record(None, event).await;
+            let message = format!(
+                "The executor could not carry it out: {error}. The call stays parked; approve it again to retry."
+            );
+            refuse(StatusCode::BAD_GATEWAY, "executor_failed", &message)
+        }
+    }
+}
+
+/// What a rollback request asks for.
+fn read_rollback(body: &[u8]) -> Result<(Filter, bool), String> {
+    let usage = "The body must be JSON like {\"agent\": \"support-bot\", \"since_secs\": 3600, \"ids\": [\"und_...\"], \"run\": false}.";
+    let value: Value = if body.iter().all(u8::is_ascii_whitespace) {
+        json!({})
+    } else {
+        serde_json::from_slice(body).map_err(|_| usage.to_string())?
+    };
+    let Some(fields) = value.as_object() else {
+        return Err(usage.into());
+    };
+    let mut filter = Filter::default();
+    for (key, item) in fields {
+        match (key.as_str(), item) {
+            (_, Value::Null) => {}
+            ("agent", Value::String(agent)) if !agent.is_empty() && agent.len() <= 128 => {
+                filter.agent = Some(agent.clone());
+            }
+            ("since_ms", item) if item.is_u64() => filter.since_ms = item.as_u64(),
+            ("since_secs", item) if item.is_u64() => {
+                let secs = item.as_u64().unwrap_or(0);
+                filter.since_ms = Some(now_ms().saturating_sub(secs.saturating_mul(1000)));
+            }
+            ("ids", Value::Array(ids)) if ids.len() <= rollback::MAX_IDS => {
+                for id in ids {
+                    match id.as_str() {
+                        Some(id) if rollback::is_undo_id(id) => filter.ids.push(id.to_string()),
+                        _ => {
+                            return Err("Each id must look like und_ and 24 hex characters.".into())
+                        }
+                    }
+                }
+            }
+            ("run", Value::Bool(_)) => {}
+            _ => return Err(usage.into()),
+        }
+    }
+    if filter.is_empty() {
+        return Err(
+            "Say what to roll back: an agent, a start time, or undo ids. \
+                    Everything ever done cannot be rolled back in one request."
+                .into(),
+        );
+    }
+    Ok((filter, value["run"] == true))
+}
+
+/// `POST /razorwire/rollback`: show what would be undone, or with
+/// `"run": true`, undo it, newest first, stopping at the first failure.
+async fn rollback(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let by = match admin(&state, peer, "/razorwire/rollback", &headers).await {
+        Ok(name) => name,
+        Err(refusal) => return *refusal,
+    };
+    let (filter, run) = match read_rollback(&body) {
+        Ok(request) => request,
+        Err(message) => return refuse(StatusCode::BAD_REQUEST, "bad_request", &message),
+    };
+    if run && state.executor.is_none() {
+        return refuse(StatusCode::CONFLICT, "no_executor", NO_EXECUTOR);
+    }
+    // A run makes its plan under the lock, so two rollbacks never undo the
+    // same step.
+    let _running = match run.then(|| state.rollback_lock.try_lock()) {
+        Some(Err(_)) => {
+            return refuse(
+                StatusCode::CONFLICT,
+                "rollback_running",
+                "Another rollback is running. Wait for it to finish, then look again.",
+            )
+        }
+        guard => guard,
+    };
+    let events = match state.audit.events().await {
+        Ok(events) => events,
+        Err(message) => return refuse(StatusCode::CONFLICT, "log_unreadable", &message),
+    };
+    let config = state.config();
+    let steps = rollback::plan(&events, config.policy.as_deref(), &filter);
+    let Some(executor) = state.executor.as_ref().filter(|_| run) else {
+        let steps: Vec<Value> = steps.iter().map(rollback::Step::summary).collect();
+        return reply(json!({ "run": false, "now_ms": now_ms(), "steps": steps }));
+    };
+
+    let started = json!({
+        "event": "rollback_started",
+        "by": by,
+        "filter": filter.as_json(),
+        "steps": steps.len(),
+    });
+    state.record(None, started).await;
+    let (mut undone, mut failed) = (0, false);
+    let mut shown = Vec::with_capacity(steps.len());
+    for step in &steps {
+        let mut summary = step.summary();
+        let outcome = if failed {
+            "not_tried"
+        } else if step.done {
+            "already_undone"
+        } else if let (Some(job), UndoPlan::Call { tool, arguments }) = (step.job(&by), &step.undo)
+        {
+            let event = json!({
+                "event": "undo_started",
+                "undo_id": step.id,
+                "by": by,
+                "agent": step.agent,
+                "tool": tool,
+                "arguments": arguments,
+                "undoes": { "tool": step.tool, "call_id": step.call_id },
+            });
+            state.record(None, event).await;
+            match executor.run(&job).await {
+                Ok(output) => {
+                    let event = json!({ "event": "undo_done", "undo_id": step.id, "by": by, "output": output });
+                    state.record(None, event).await;
+                    summary["output"] = output;
+                    undone += 1;
+                    "undone"
+                }
+                Err(error) => {
+                    let event = json!({ "event": "undo_failed", "undo_id": step.id, "by": by, "error": error });
+                    state.record(None, event).await;
+                    summary["error"] = json!(error);
+                    failed = true;
+                    "failed"
+                }
+            }
+        } else {
+            "cannot_undo"
+        };
+        summary["outcome"] = json!(outcome);
+        shown.push(summary);
+    }
+    let finished = json!({
+        "event": "rollback_finished",
+        "by": by,
+        "undone": undone,
+        "failed": failed,
+    });
+    state.record(None, finished).await;
+    reply(
+        json!({ "run": true, "now_ms": now_ms(), "undone": undone, "failed": failed, "steps": shown }),
+    )
 }
 
 /// The optional `{"reason": "..."}` body of an approve or deny request.
@@ -234,9 +474,22 @@ impl Client {
         if !key.starts_with(auth::KEY_PREFIX) {
             return Err("Set RAZORWIRE_ADMIN_KEY to an admin key. Create one with `razorwire new-key admin <name>`".into());
         }
-        let http = reqwest::Client::builder()
+        let mut http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        // A self-signed certificate is trusted only when named here.
+        if let Some(path) = std::env::var("RAZORWIRE_CA_CERT")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+        {
+            let path = path.trim();
+            let pem = std::fs::read(path)
+                .map_err(|err| format!("cannot read RAZORWIRE_CA_CERT {path}: {err}"))?;
+            let certificate = reqwest::Certificate::from_pem(&pem)
+                .map_err(|_| format!("RAZORWIRE_CA_CERT {path} is not a PEM certificate"))?;
+            http = http.add_root_certificate(certificate);
+        }
+        let http = http
             .build()
             .map_err(|err| format!("cannot build the HTTP client: {err}"))?;
         Ok(Client {
@@ -281,6 +534,33 @@ impl Client {
         let answer = self.call(false, "/razorwire/approvals", None).await?;
         let now = answer["now_ms"].as_u64().unwrap_or_else(now_ms);
         let pending = answer["pending"].as_array().cloned().unwrap_or_default();
+        let parked = answer["parked"].as_array().cloned().unwrap_or_default();
+        if !parked.is_empty() {
+            let count = parked.len();
+            println!(
+                "{count} parked call{}: nobody decided in time and the agent stopped waiting. \
+                 Approving one has the executor carry it out now.\n",
+                if count == 1 { "" } else { "s" }
+            );
+            for call in &parked {
+                let left = call["parked_until_ms"]
+                    .as_u64()
+                    .unwrap_or(now)
+                    .saturating_sub(now)
+                    / 1000;
+                println!(
+                    "  {}  {}  agent: {}  rule: {}  {}d {}h left",
+                    shown_value(&call["id"]),
+                    shown_value(&call["tool"]),
+                    shown_value(&call["agent"]),
+                    shown_value(&call["rule"]),
+                    left / 86_400,
+                    left % 86_400 / 3600,
+                );
+                println!("      arguments: {}", json_line(&call["arguments"]));
+                println!("      why held:  {}\n", shown_value(&call["message"]));
+            }
+        }
         if pending.is_empty() {
             println!("No tool calls are waiting for approval.");
             return Ok(());
@@ -334,6 +614,81 @@ impl Client {
             shown_value(&answer["tool"]),
             shown_value(&answer["agent"]),
         );
+        if answer["ran"] == true {
+            println!(
+                "It was parked, so the executor carried it out. It answered: {}",
+                json_line(&answer["output"])
+            );
+        }
+        Ok(())
+    }
+
+    /// Show what a rollback would undo, or with `run`, undo it.
+    pub async fn rollback(&self, filter: Value, run: bool) -> Result<(), String> {
+        let mut body = filter;
+        body["run"] = json!(run);
+        let answer = self.call(true, "/razorwire/rollback", Some(body)).await?;
+        let now = answer["now_ms"].as_u64().unwrap_or_else(now_ms);
+        let steps = answer["steps"].as_array().cloned().unwrap_or_default();
+        if steps.is_empty() {
+            println!("No actions that went through match, so there is nothing to roll back.");
+            return Ok(());
+        }
+        let can = |step: &&Value| step["undo"].is_object() && step["done"] != true;
+        if !run {
+            let count = steps.len();
+            println!(
+                "{count} action{} went through, newest first:\n",
+                if count == 1 { "" } else { "s" }
+            );
+            for step in &steps {
+                print_step(step, now);
+            }
+            let undoable = steps.iter().filter(can).count();
+            if undoable == 0 {
+                println!("None of them can be undone automatically.");
+            } else {
+                println!(
+                    "Nothing was undone yet. To undo the {undoable} that can be, newest first, run the same command with --run."
+                );
+            }
+            return Ok(());
+        }
+        for step in &steps {
+            let outcome = step["outcome"].as_str().unwrap_or("");
+            let label = match outcome {
+                "undone" => "undone      ",
+                "already_undone" => "was undone  ",
+                "cannot_undo" => "cannot undo ",
+                "failed" => "FAILED      ",
+                _ => "not tried   ",
+            };
+            let detail = match outcome {
+                "undone" | "failed" | "already_undone" => format!(
+                    "{} {}",
+                    shown_value(&step["undo"]["tool"]),
+                    json_line(&step["undo"]["arguments"])
+                ),
+                "cannot_undo" => shown_value(&step["cannot_undo"]),
+                _ => String::new(),
+            };
+            println!(
+                "  {label} {}  {}  {detail}",
+                shown_value(&step["id"]),
+                shown_value(&step["tool"]),
+            );
+            if outcome == "failed" {
+                println!("               {}", shown_value(&step["error"]));
+            }
+        }
+        let undone = answer["undone"].as_u64().unwrap_or(0);
+        if answer["failed"] == true {
+            return Err(format!(
+                "undid {undone}, then one failed. Older actions were left as they are. \
+                 Fix the problem and run it again: what was undone is skipped"
+            ));
+        }
+        println!("\nUndid {undone}.");
         Ok(())
     }
 
@@ -355,6 +710,41 @@ impl Client {
         );
         Ok(())
     }
+}
+
+fn print_step(step: &Value, now: u64) {
+    let ago = now.saturating_sub(step["ts_ms"].as_u64().unwrap_or(now)) / 1000;
+    let ago = match ago {
+        0..=119 => format!("{ago}s ago"),
+        120..=7199 => format!("{}m ago", ago / 60),
+        7200..=172_799 => format!("{}h ago", ago / 3600),
+        _ => format!("{}d ago", ago / 86_400),
+    };
+    println!(
+        "  {}  {ago}  {}  agent: {}",
+        shown_value(&step["id"]),
+        shown_value(&step["tool"]),
+        shown_value(&step["agent"]),
+    );
+    println!("      did:   {}", json_line(&step["arguments"]));
+    if step["done"] == true {
+        println!("      undone already");
+    } else if step["undo"].is_object() {
+        println!(
+            "      undo:  {} {}",
+            shown_value(&step["undo"]["tool"]),
+            json_line(&step["undo"]["arguments"])
+        );
+    } else {
+        println!(
+            "      cannot be undone: {}",
+            shown_value(&step["cannot_undo"])
+        );
+    }
+    if let Some(error) = step["last_error"].as_str() {
+        println!("      last try failed: {}", shown(error));
+    }
+    println!();
 }
 
 #[cfg(test)]

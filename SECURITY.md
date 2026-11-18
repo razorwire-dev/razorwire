@@ -19,8 +19,13 @@ and to make tampering visible.
 | Someone edits the audit log to hide what happened | With `AUDIT_KEY`, every line carries an HMAC that also covers the line before it. `razorwire verify-log` finds the first line that was edited, added, removed or moved. |
 | Text from the model tries to trick the operator's terminal | Control characters and Unicode direction marks are escaped in log lines and in `razorwire approvals`. Reasons typed by an approver are cleaned the same way. |
 | A flood of requests | Request bodies are capped at 32 MB (16 KB on the admin API). At most 512 requests run at once; more get 503. At most 256 calls wait for approval at once. Failed key checks are logged at most 20 times a minute. A provider that goes silent for 10 minutes is given up on. |
-| The admin key crosses a network in the clear | The admin commands refuse a plain-http `RAZORWIRE_URL` unless it points at this machine. |
-| A bad config silently turns protection off | A policy, keys file or audit key that is missing or invalid stops the proxy from starting. A reload that finds an invalid file changes nothing. |
+| The admin key crosses a network in the clear | The admin commands refuse a plain-http `RAZORWIRE_URL` unless it points at this machine. With `TLS_CERT` and `TLS_KEY`, Razorwire serves https itself (TLS 1.2 or later). A slow TLS handshake is cut off after 10 seconds, and at most 256 run at once. |
+| A bad config silently turns protection off | A policy, keys file, audit key, certificate or executor setting that is missing or invalid stops the proxy from starting. A reload that finds an invalid file changes nothing. |
+| A streamed reply slips a tool call through while it is still arriving | Under enforcement, only events known to carry nothing but text go out as they arrive. From the first event that could carry a tool call, or that is not understood, everything is held until the whole reply is checked. A stream that cannot be read, or that is cut off, ends with an error instead of the rest. |
+| Someone forges a request to the executor | Every request is signed with HMAC-SHA256 over a timestamp and the body, using `EXECUTOR_KEY`. The example executor refuses a bad signature or a timestamp more than 5 minutes off, and never runs the same id twice. `EXECUTOR_URL` must be https unless it is on this machine, and redirects are not followed. |
+| A rollback acts on a doctored log | Rollback and the restore of parked calls read the signed audit log, and refuse it if any line fails its check. The calls and arguments they act on come from the log, not from anything an agent sends. |
+| Two admins carry out the same thing twice | A parked call is taken out while it runs, and one rollback runs at a time. A step that was undone is recorded and skipped next time. |
+| A revoked person keeps approving | `razorwire revoke-key` removes the key and reloads the running proxy when it can, and says so plainly when it cannot. |
 
 ## What it does not protect against
 
@@ -33,9 +38,21 @@ and to make tampering visible.
   can, and copy the log somewhere the agent cannot reach.
 - **Lines cut off the end of the log.** The file alone cannot show that its
   last lines were removed. Compare the last `seq` with a copy kept elsewhere.
-- **Plain HTTP.** Razorwire has no TLS of its own. Anything beyond this
-  machine needs a TLS proxy in front, such as Caddy or nginx, or keys and
-  prompts can be read on the wire.
+- **Plain HTTP by default.** Without `TLS_CERT` and `TLS_KEY`, Razorwire
+  speaks plain HTTP. Anything beyond this machine needs https, from
+  Razorwire itself or a TLS proxy in front, or keys and prompts can be read
+  on the wire. Razorwire does not ask clients for certificates.
+- **Results an agent reports.** An undo recipe that uses `result` trusts what
+  the agent said the tool returned. A lying agent could point an undo at
+  something else, such as another ticket. Read the plan before `--run`,
+  prefer recipes built from `args`, and have the executor check that what it
+  is asked to undo is something the agent made.
+- **The executor itself.** It holds real credentials. Run it where agents
+  cannot reach it, keep `EXECUTOR_KEY` secret, and give it only the actions
+  it needs. Anyone with the key can ask it to act.
+- **Approving a parked call later.** Its arguments are the ones the model
+  asked for back then. The world may have changed since; check before you
+  approve.
 - **Tool calls that never pass through it.** Tools the agent runs without
   asking the model, tools the provider runs itself (web search, code
   interpreter), and the Responses API's computer and shell calls are not
@@ -57,10 +74,13 @@ and to make tampering visible.
    machine regularly.
 4. Run the proxy as its own user. The agent must not be able to read or
    write the keys file, the policy, the audit log or the proxy's environment.
-5. Listen on `127.0.0.1`, or put TLS in front.
+5. Listen on `127.0.0.1`, or turn on https with `TLS_CERT` and `TLS_KEY`.
 6. Block the agent's direct network access to the provider.
-7. To rotate a key: create the new one, `razorwire reload`, switch the agent
-   over, delete the old line, `razorwire reload` again.
+7. To rotate a key: create the new one, switch the agent over, then
+   `razorwire revoke-key <old name> <fingerprint>`. With
+   `RAZORWIRE_ADMIN_KEY` set, both commands reload the proxy themselves.
+8. If you use rollback or parked calls, run the executor as yet another
+   user, on a machine or network the agent cannot reach.
 
 ## Reporting a problem
 

@@ -7,7 +7,8 @@ Every tool call the model asks for is checked against your rules. A call that
 breaks a rule is removed from the response before the agent receives it, so
 the agent has nothing to execute. A risky call can be held until a human
 approves it. Every decision goes into an audit log that can be signed, so
-tampering shows.
+tampering shows. And when something an agent did turns out to be wrong,
+`razorwire rollback` undoes it, newest first.
 
 Status: early. It works for OpenAI-compatible APIs, streamed and
 non-streamed. See [Limits](#limits) and [SECURITY.md](SECURITY.md).
@@ -171,6 +172,105 @@ agent hangs up, the call is blocked. Approving needs an admin key, and an
 agent's key can never approve, so an agent cannot wave its own calls
 through. With no admin key set up, `review` blocks at once.
 
+### When you are not there
+
+- **Ask less often.** Put rules in tiers, so only the middle band needs a
+  person. The example policy lets refunds up to 500 through, holds 500 to
+  5,000, never lets an agent refund more than 5,000, and holds every refund
+  after the third in one run.
+- **Let someone else approve.** `razorwire new-key admin <name>` makes a
+  second admin key. Give it to that person privately; they set it as
+  `RAZORWIRE_ADMIN_KEY`. `razorwire keys` lists every key and
+  `razorwire revoke-key <name>` takes one away.
+- **Approve from another computer.** Start Razorwire with `TLS_CERT` and
+  `TLS_KEY` and it serves https. On the other computer, set `RAZORWIRE_URL`
+  to `https://<host>:<port>` and, for a self-signed certificate,
+  `RAZORWIRE_CA_CERT` to it.
+- **Approve later.** With an [executor](#undo-what-an-agent-did) set up, a
+  call nobody decided in time is parked instead of thrown away. It shows in
+  `razorwire approvals` for 7 days, survives restarts, and approving it then
+  has the executor carry it out, since the agent stopped waiting. The agent
+  is told it was parked, so it does not try again.
+
+## Undo what an agent did
+
+Blocking stops a bad call before it runs. Rollback is for the calls that
+went through and should not have.
+
+The policy says how to reverse each tool:
+
+```yaml
+undo:
+  - tool: create_ticket
+    when: has(result.id)          # only when the ticket was actually made
+    call:
+      tool: close_ticket
+      args:
+        id: result.id             # from what the tool returned
+        comment: '"Closed by a Razorwire rollback."'
+
+  - tool: grant_role
+    call:
+      tool: revoke_role
+      args:
+        user: args.user           # from the original call
+        role: args.role
+```
+
+`razorwire rollback` reads the audit log, finds the calls that went through,
+and shows how each would be undone. Nothing happens until you add `--run`:
+
+```
+$ razorwire rollback --agent support-bot --since 1h
+3 actions went through, newest first:
+
+  und_0ac1fe3e9f0e8f8a3b6d7c21  4m ago  db_drop  agent: support-bot
+      did:   {"database":"staging"}
+      cannot be undone: the policy has no undo recipe for db_drop
+
+  und_7d2c90b1a4e65f0c8e1b3a77  4m ago  grant_role  agent: support-bot
+      did:   {"role":"admin","user":"u1"}
+      undo:  revoke_role {"role":"admin","user":"u1"}
+
+  und_51e0b9c37a2d48f6e0c9d1b2  4m ago  create_ticket  agent: support-bot
+      did:   {"title":"refund request"}
+      undo:  close_ticket {"comment":"Closed by a Razorwire rollback.","id":812}
+
+Nothing was undone yet. To undo the 2 that can be, newest first, run the same command with --run.
+```
+
+With `--run`, each undo goes to your **executor**: a small web service you
+run that holds the real credentials. Razorwire never touches your systems
+itself; it signs each request with `EXECUTOR_KEY` and the executor checks
+the signature. [examples/executor.py](examples/executor.py) is a starting
+point with no dependencies. Undos run newest first and stop at the first
+failure; running the same command again skips what was already undone.
+
+The calls and their arguments come from the signed audit log, and a log
+that fails its check is refused. Results are what the agent reported the
+tool returned.
+
+## Install
+
+macOS and Linux:
+
+```
+curl -fsSL https://raw.githubusercontent.com/razorwire-dev/razorwire/main/install.sh | sh
+```
+
+Windows PowerShell:
+
+```
+irm https://raw.githubusercontent.com/razorwire-dev/razorwire/main/install.ps1 | iex
+```
+
+The scripts download the build for your machine from the latest release and
+check it against the release's `SHA256SUMS` before installing it. While the
+repository is private, set `GITHUB_TOKEN` to a token that can read it first.
+Release builds exist for Linux x86_64 (static, any distribution), macOS on
+Apple silicon and Intel, and Windows x86_64. Anywhere else, or to build it
+yourself: `cargo install --path .`
+
 ## Run it
 
 You need [Rust](https://rustup.rs) and an API key for an OpenAI-compatible
@@ -226,6 +326,9 @@ model = ChatOpenAI(model="openai/gpt-oss-120b", base_url="http://127.0.0.1:8080/
 | `AUDIT_LOG` | `audit.jsonl` | Where events are written |
 | `AUDIT_KEY` | unset | Signs the audit log so tampering shows |
 | `APPROVAL_TIMEOUT_SECS` | `300` | How long a held call waits for a human, 1 to 3600 |
+| `TLS_CERT`, `TLS_KEY` | unset | PEM certificate chain and PKCS#8 key: serve https |
+| `STREAM_MODE` | `live` | `live`: streamed text reaches the agent as it arrives. `hold`: the whole reply waits until it is checked |
+| `EXECUTOR_URL`, `EXECUTOR_KEY` | unset | The service that carries out undos and parked calls |
 
 ## Lock it down
 
@@ -268,26 +371,33 @@ Install the `razorwire` command with `cargo install --path .`, or use
 With agent keys set up, a request without a valid key is refused with 401,
 and the agent's name in rules and in the log comes from its key, not from
 anything the agent says. Razorwire refuses to listen on a network address
-unless agent keys are set up. It speaks plain HTTP, so put a TLS proxy such
-as Caddy in front before keys cross a network. [SECURITY.md](SECURITY.md)
-lists what this protects against and what it does not.
+unless agent keys are set up. Before keys cross a network, turn on https
+with `TLS_CERT` and `TLS_KEY`, or put a TLS proxy such as Caddy in front.
+[SECURITY.md](SECURITY.md) lists what this protects against and what it
+does not.
 
 ## Commands
 
 ```
 razorwire                        start the proxy
 razorwire new-key <agent|admin> <name>
+razorwire keys                   list keys, with the start of each hash
+razorwire revoke-key <name> [fingerprint]
 razorwire new-audit-key
+razorwire new-executor-key
 razorwire check-policy <file>
 razorwire verify-log [file]
-razorwire approvals
+razorwire approvals              held calls, and parked ones
 razorwire approve <id> [reason]
 razorwire deny <id> [reason]
+razorwire rollback [--agent <name>] [--since 30m|2h|1d] [<undo id>...] [--run]
 razorwire reload                 re-read the policy and keys files without a restart
 ```
 
 The admin commands talk to `RAZORWIRE_URL` (default
-`http://127.0.0.1:8080`) with `RAZORWIRE_ADMIN_KEY`. A reload that finds an
+`http://127.0.0.1:8080`, https for anything else) with
+`RAZORWIRE_ADMIN_KEY`. `new-key` and `revoke-key` reload the running proxy
+themselves when `RAZORWIRE_ADMIN_KEY` is set. A reload that finds an
 invalid file changes nothing and keeps the last good configuration.
 
 ## Policies
@@ -323,6 +433,8 @@ rules:
 - Actions are `allow`, `deny` and `review`. `review` holds the call for
   [human approval](#human-approval).
 - Start in `mode: shadow` to see what would be blocked before you enforce it.
+- An optional `undo` section says how to reverse each tool, for
+  [rollback](#undo-what-an-agent-did).
 - Check a policy without starting the proxy: `razorwire check-policy <file>`.
 
 The full format is in [policy/policy.schema.json](policy/policy.schema.json).
@@ -362,14 +474,17 @@ terminal control codes. Keys are never logged.
 
 ## Limits
 
-- **Streamed replies are delayed under enforcement.** To check a streamed
-  reply, Razorwire holds it until it is complete, so the agent gets it in one
-  burst instead of word by word. In shadow mode and with no policy, streams
-  pass through live.
+- **Streamed tool calls wait for their check.** Under enforcement, streamed
+  text reaches the agent as it arrives, but from the first tool call on, the
+  rest of the reply is held until the whole reply has been checked. A
+  streamed reply carries no `x-razorwire-blocked` header, because its headers
+  are sent before the check; the note in the reply says what was blocked.
 - **Tested with a few clients so far.** Verified against Groq with raw HTTP
   clients, the official OpenAI Python SDK (Chat Completions and the Responses
-  API, streamed and not) and LangGraph through `langchain-openai` (plain and
-  streamed). Not yet tested with CrewAI.
+  API, streamed and not), LangGraph through `langchain-openai`, and CrewAI
+  (plain and streamed for both). When CrewAI's agent gets a reply whose only
+  call was blocked, it takes Razorwire's note as its final answer and ends
+  the task.
 - **Loop counts come from the conversation the agent sends.** An agent that
   trims or rewrites its history starts its counts over. With the Responses
   API's `previous_response_id`, only the turns sent in the request are counted.
@@ -381,17 +496,21 @@ terminal control codes. Keys are never logged.
 - **Without agent keys, the agent name is self-declared.** `x-agent-name` is
   taken at its word until you [set up keys](#lock-it-down).
 - **Approvals hold the whole response.** Other calls in the same response
-  wait with the held one. Pending approvals live in memory, so a restart
-  drops them, and the agent's request fails.
-- **No TLS of its own.** Put a TLS proxy in front for anything beyond this
-  machine.
+  wait with the held one. Calls still waiting live in memory, so a restart
+  drops them and the agent's request fails. Parked calls are kept in the
+  audit log and survive a restart.
+- **Rollback is only as good as the recipes and the reported results.** A
+  tool with no undo recipe cannot be undone automatically. An undo built
+  from a result trusts what the agent said the tool returned, so check the
+  plan before `--run`, and have the executor check what it is asked to
+  touch. Rollback reads the whole audit log into memory.
 - **The log cannot show lines cut off its end.** Keep a copy elsewhere if
   that matters. See [SECURITY.md](SECURITY.md).
 
 ## Roadmap
 
-Live streaming under enforcement, rollback of executed actions, independent
-verification of results, an approvals dashboard, and an easier install.
+Independent verification of results, notifications when a call is held, an
+approvals dashboard, and SDKs for Python and TypeScript.
 
 ## License
 

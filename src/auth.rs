@@ -22,9 +22,14 @@ pub const KEY_HEADER: &str = "x-razorwire-key";
 /// Written at the top of a new keys file.
 pub const KEYS_FILE_HEADER: &str = "\
 # Razorwire keys, one per line: <role> <name> <sha256 of the key>.
-# Only hashes are stored here. Create keys with `razorwire new-key`.
-# Delete a line and run `razorwire reload` to revoke that key.
+# Only hashes are stored here. Create keys with `razorwire new-key` and
+# remove them with `razorwire revoke-key`, or delete a line and run
+# `razorwire reload`.
 ";
+
+/// How many characters of a key's hash are shown to tell keys with the same
+/// name apart. The hash cannot be turned back into the key.
+pub const FINGERPRINT_CHARS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -137,12 +142,118 @@ impl Keys {
         self.by_hash.values().filter(|id| id.role == role).count()
     }
 
+    /// Every key, admins first, then by name. Only the start of each hash is
+    /// given, to tell keys with the same name apart.
+    pub fn listed(&self) -> Vec<Listed> {
+        let mut all: Vec<Listed> = self
+            .by_hash
+            .iter()
+            .map(|(hash, identity)| Listed {
+                role: identity.role,
+                name: identity.name.clone(),
+                fingerprint: hash[..FINGERPRINT_CHARS].to_string(),
+            })
+            .collect();
+        all.sort_by(|a, b| {
+            (a.role == Role::Agent, &a.name, &a.fingerprint).cmp(&(
+                b.role == Role::Agent,
+                &b.name,
+                &b.fingerprint,
+            ))
+        });
+        all
+    }
+
     /// Who a presented key belongs to, if anyone.
     pub fn identify(&self, key: &str) -> Option<&Identity> {
         if !key.starts_with(KEY_PREFIX) {
             return None;
         }
         self.by_hash.get(&hash(key))
+    }
+}
+
+/// One key as `razorwire keys` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub role: Role,
+    pub name: String,
+    pub fingerprint: String,
+}
+
+/// The text of a keys file with one key taken out: the key named `name`, or,
+/// when several keys share that name, the one whose hash starts with
+/// `fingerprint`. Comments and every other line are kept as they are.
+pub fn without_key(
+    text: &str,
+    name: &str,
+    fingerprint: Option<&str>,
+) -> Result<(String, Listed), KeyError> {
+    // Never edit a file that is already broken.
+    Keys::parse(text)?;
+    let fingerprint = fingerprint.map(str::to_ascii_lowercase);
+    if let Some(print) = &fingerprint {
+        if print.len() < 4 || !print.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(KeyError(
+                "a fingerprint is at least 4 hex characters, as `razorwire keys` shows it".into(),
+            ));
+        }
+    }
+
+    let mut kept = String::with_capacity(text.len());
+    let mut removed = Vec::new();
+    let mut same_name = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let entry = match fields[..] {
+            [role, key_name, hash] if key_name == name => {
+                // The file was checked above, so a line with this shape is a
+                // key and its hash is 64 hex characters.
+                Role::parse(role.trim_start_matches('\u{feff}')).map(|role| {
+                    let hash = hash.to_ascii_lowercase();
+                    let listed = Listed {
+                        role,
+                        name: key_name.to_string(),
+                        fingerprint: hash[..FINGERPRINT_CHARS].to_string(),
+                    };
+                    (listed, hash)
+                })
+            }
+            _ => None,
+        };
+        match entry {
+            Some((listed, hash))
+                if fingerprint
+                    .as_deref()
+                    .is_none_or(|print| hash.starts_with(print)) =>
+            {
+                removed.push(listed.clone());
+                same_name.push(listed);
+            }
+            Some((listed, _)) => {
+                same_name.push(listed);
+                kept.push_str(line);
+            }
+            None => kept.push_str(line),
+        }
+    }
+
+    match removed.len() {
+        1 => Ok((kept, removed.remove(0))),
+        0 if same_name.is_empty() => Err(KeyError(format!(
+            "there is no key named {name}. Run `razorwire keys` to see them"
+        ))),
+        0 => Err(KeyError(format!(
+            "no key named {name} has a fingerprint starting with that. Run `razorwire keys` to see them"
+        ))),
+        _ => {
+            let prints: Vec<String> = removed.iter().map(|key| key.fingerprint.clone()).collect();
+            Err(KeyError(format!(
+                "{} keys are named {name} (fingerprints {}). Say which: `razorwire revoke-key {name} <fingerprint>`",
+                removed.len(),
+                prints.join(", ")
+            )))
+        }
     }
 }
 
@@ -301,6 +412,64 @@ mod tests {
             );
             assert!(!err.contains(&key), "errors must not echo a key");
         }
+    }
+
+    #[test]
+    fn keys_are_listed_without_their_hashes() {
+        let agent = generate().unwrap();
+        let admin = generate().unwrap();
+        let keys = Keys::parse(&file_with(&[
+            (Role::Agent, "ops-bot", &agent),
+            (Role::Admin, "mann", &admin),
+        ]))
+        .unwrap();
+        let listed = keys.listed();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            (listed[0].role, listed[0].name.as_str()),
+            (Role::Admin, "mann")
+        );
+        assert_eq!(listed[0].fingerprint, hash(&admin)[..FINGERPRINT_CHARS]);
+        assert_eq!(listed[1].name, "ops-bot");
+    }
+
+    #[test]
+    fn a_key_is_revoked_by_name_and_the_rest_of_the_file_is_kept() {
+        let (a, b, c) = (
+            generate().unwrap(),
+            generate().unwrap(),
+            generate().unwrap(),
+        );
+        let text = format!(
+            "{}\r\n# keep me\n{}\n{}\n",
+            key_line(Role::Admin, "mann", &a),
+            key_line(Role::Admin, "ada", &b),
+            key_line(Role::Admin, "ada", &c)
+        );
+
+        let (kept, removed) = without_key(&format!("\u{feff}{text}"), "mann", None).unwrap();
+        assert_eq!((removed.role, removed.name.as_str()), (Role::Admin, "mann"));
+        assert!(!kept.contains(&hash(&a)));
+        assert!(kept.contains("# keep me\n"));
+        let keys = Keys::parse(&kept).unwrap();
+        assert!(keys.identify(&a).is_none());
+        assert!(keys.identify(&b).is_some());
+
+        // Two keys share a name, so the fingerprint says which one goes.
+        let err = without_key(&text, "ada", None).unwrap_err().to_string();
+        assert!(err.contains("2 keys are named ada"), "{err}");
+        let print = hash(&c)[..FINGERPRINT_CHARS].to_uppercase();
+        let (kept, removed) = without_key(&text, "ada", Some(&print)).unwrap();
+        assert_eq!(removed.fingerprint, hash(&c)[..FINGERPRINT_CHARS]);
+        let keys = Keys::parse(&kept).unwrap();
+        assert!(keys.identify(&b).is_some());
+        assert!(keys.identify(&c).is_none());
+
+        let missing = without_key(&text, "nobody", None).unwrap_err().to_string();
+        assert!(missing.contains("no key named nobody"), "{missing}");
+        assert!(without_key(&text, "ada", Some("zz")).is_err());
+        assert!(without_key(&text, "ada", Some("0000000")).is_err());
+        assert!(without_key("agent broken\n", "broken", None).is_err());
     }
 
     #[test]

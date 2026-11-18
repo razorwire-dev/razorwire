@@ -17,3 +17,14 @@ serde-saphyr = { version = "2", default-features = false, features = ["deseriali
 serde_json = "1"
 sha2 = "0.11.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "io-util", "sync", "time"] }
+# Already used by reqwest for https to the provider; this serves https too.
+tokio-native-tls = "0.3"
+
+[features]
+# Builds OpenSSL from source and links it in, so the Linux release binary
+# runs on any distribution. Release builds only; it needs a C compiler.
+vendored-openssl = ["tokio-native-tls/vendored"]
+
+[profile.release]
+strip = true
+lto = "thin"

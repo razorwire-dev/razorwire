@@ -1176,7 +1176,7 @@ mod tests {
                     "type": "function_call",
                     "call_id": "call_2",
                     "name": "stripe_refund",
-                    "arguments": "{\"amount\":47000}"
+                    "arguments": "{\"amount\":4700}"
                 },
                 {
                     "type": "function_call",
@@ -1269,7 +1269,7 @@ mod tests {
 
     #[test]
     fn a_review_call_is_held_without_changing_the_response() {
-        let mut response = chat_response(vec![refund_call("big", 47000), refund_call("small", 20)]);
+        let mut response = chat_response(vec![refund_call("big", 4700), refund_call("small", 20)]);
         let original = response.clone();
 
         let plan = plan_with_holds(&mut response);
@@ -1279,7 +1279,7 @@ mod tests {
         let hold = &plan.holds[0];
         assert_eq!(hold.tool, "stripe_refund");
         assert_eq!(hold.call_id, "big");
-        assert_eq!(hold.arguments["amount"], 47000);
+        assert_eq!(hold.arguments["amount"], 4700);
         assert_eq!(hold.rule.as_deref(), Some("refund-cap"));
         let event = &plan.events[hold.event];
         assert_eq!(event["decision"], "review");
@@ -1290,7 +1290,7 @@ mod tests {
 
     #[test]
     fn an_approved_call_goes_through() {
-        let mut response = chat_response(vec![refund_call("big", 47000)]);
+        let mut response = chat_response(vec![refund_call("big", 4700)]);
         let original = response.clone();
         let mut plan = plan_with_holds(&mut response);
 
@@ -1303,7 +1303,7 @@ mod tests {
 
     #[test]
     fn a_denied_call_is_removed_with_the_reason() {
-        let mut response = chat_response(vec![refund_call("big", 47000), refund_call("small", 20)]);
+        let mut response = chat_response(vec![refund_call("big", 4700), refund_call("small", 20)]);
         let mut plan = plan_with_holds(&mut response);
 
         plan.refuse(0, "Denied by mann: wrong order.");
@@ -1331,7 +1331,7 @@ mod tests {
                 "type": "function_call",
                 "call_id": "c1",
                 "name": "stripe_refund",
-                "arguments": "{\"amount\":47000}"
+                "arguments": "{\"amount\":4700}"
             }]
         });
         let plan = plan_with_holds(&mut response);
@@ -1348,7 +1348,7 @@ mod tests {
 
     #[test]
     fn a_held_call_counts_as_blocked_for_the_calls_after_it() {
-        let mut response = chat_response(vec![refund_call("big", 47000), status_call("s", 1)]);
+        let mut response = chat_response(vec![refund_call("big", 4700), status_call("s", 1)]);
         let plan = plan_with_holds(&mut response);
         assert_eq!(plan.events[1]["run"]["blocked"], 1);
         assert_eq!(plan.events[1]["run"]["calls"], 0);
@@ -1356,7 +1356,7 @@ mod tests {
 
     #[test]
     fn shadow_mode_never_holds() {
-        let mut response = chat_response(vec![refund_call("big", 47000)]);
+        let mut response = chat_response(vec![refund_call("big", 4700)]);
         let policy = shadow_policy();
         let plan = plan(&mut response, Some(&policy), "", &History::default(), true);
         assert!(plan.holds.is_empty());

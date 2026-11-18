@@ -23,6 +23,11 @@
     "rules": {
       "type": "array",
       "items": { "$ref": "#/$defs/rule" }
+    },
+    "undo": {
+      "description": "How to reverse calls that went through, for `razorwire rollback`. A tool with no recipe cannot be undone automatically.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/undo" }
     }
   },
   "$defs": {
@@ -69,6 +74,43 @@
         "message": {
           "description": "Returned to the agent and written to the audit log when the rule denies or holds a call.",
           "type": "string"
+        }
+      }
+    },
+    "undo": {
+      "type": "object",
+      "required": ["tool", "call"],
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "description": "The tool whose calls this recipe reverses. One exact name, no wildcard, and one recipe per tool.",
+          "type": "string",
+          "pattern": "^[^*]+$"
+        },
+        "description": {
+          "type": "string"
+        },
+        "when": {
+          "description": "Optional CEL expression that must be true for a call to be undoable. `args` is the original call's arguments, `result` what the agent reported the tool returned (decoded JSON if it was JSON, otherwise text, null if nothing was reported), and `agent` the agent's name.",
+          "type": "string",
+          "minLength": 1
+        },
+        "call": {
+          "description": "The call that reverses it, carried out by the executor during `razorwire rollback`.",
+          "type": "object",
+          "required": ["tool"],
+          "additionalProperties": false,
+          "properties": {
+            "tool": {
+              "type": "string",
+              "minLength": 1
+            },
+            "args": {
+              "description": "Argument name to CEL expression, with the same variables as `when`. Write text in inner quotes: '\"closed by rollback\"'.",
+              "type": "object",
+              "additionalProperties": { "type": "string", "minLength": 1 }
+            }
+          }
         }
       }
     }

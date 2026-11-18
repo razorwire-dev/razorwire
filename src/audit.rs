@@ -31,8 +31,15 @@ const MIN_KEY_BYTES: usize = 32;
 /// The chain fields sit at the very end of the last line.
 const TAIL_BYTES: u64 = 4096;
 
+/// Largest log that is read back into memory, for rollback and for parked
+/// calls.
+const MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
+
 pub struct Audit {
     writer: Mutex<Writer>,
+    path: String,
+    /// Kept to check the chain when the log is read back.
+    key: Option<Vec<u8>>,
 }
 
 struct Writer {
@@ -77,6 +84,7 @@ impl Audit {
     pub async fn open(path: &str, key: Option<Vec<u8>>) -> Result<Audit, String> {
         let (needs_newline, last) =
             read_tail(path).map_err(|err| format!("cannot read the audit log {path}: {err}"))?;
+        let check_key = key.clone();
         let chain = key.map(|key| match last {
             Some((seq, mac)) => Chain {
                 key,
@@ -101,11 +109,54 @@ impl Audit {
                 chain,
                 needs_newline,
             }),
+            path: path.to_string(),
+            key: check_key,
         })
     }
 
     pub async fn signed(&self) -> bool {
         self.writer.lock().await.chain.is_some()
+    }
+
+    /// Every event in the log, oldest first. A signed log is checked first,
+    /// and one that fails the check is refused, so nothing is acted on from
+    /// lines that may have been changed.
+    pub async fn events(&self) -> Result<Vec<Value>, String> {
+        let path = &self.path;
+        let bytes = {
+            // No line is half written while the file is read.
+            let _writer = self.writer.lock().await;
+            match tokio::fs::metadata(path).await {
+                Ok(metadata) if metadata.len() > MAX_READ_BYTES => {
+                    return Err(format!(
+                        "the audit log {path} is over {} MB, too large to read back. Start a new log file",
+                        MAX_READ_BYTES / (1024 * 1024)
+                    ));
+                }
+                _ => {}
+            }
+            match tokio::fs::read(path).await {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(err) => return Err(format!("cannot read the audit log {path}: {err}")),
+            }
+        };
+        if let Some(key) = &self.key {
+            if let Some((line, reason)) = verify(&bytes, key).broken {
+                return Err(format!(
+                    "the audit log {path} fails its check at line {line}: {reason}. \
+                     Nothing is read from a log that may have been changed; `razorwire verify-log` shows the same"
+                ));
+            }
+        }
+        Ok(bytes
+            .split(|&b| b == b'\n')
+            .filter_map(|line| {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                serde_json::from_slice::<Value>(line).ok()
+            })
+            .filter(Value::is_object)
+            .collect())
     }
 
     /// Stamp an event, sign it if there is a key, and append it to the log
@@ -391,6 +442,31 @@ mod tests {
         // A different key does not verify.
         let other = verify(&log, &[8; 32]);
         assert_eq!(other.broken.map(|(line, _)| line), Some(1));
+    }
+
+    #[tokio::test]
+    async fn events_are_read_back_only_from_a_log_that_checks_out() {
+        let path = temp_log("read-back");
+        let audit = Audit::open(&path, Some(KEY.to_vec())).await.unwrap();
+        audit.record(None, json!({ "event": "a" })).await;
+        audit
+            .record(None, json!({ "event": "b", "amount": 470 }))
+            .await;
+        let events = audit.events().await.unwrap();
+        let names: Vec<&str> = events.iter().filter_map(|e| e["event"].as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+
+        let mut changed = lines(&path);
+        changed[1] = changed[1].replace("470", "47");
+        rewrite(&path, &changed);
+        let refused = audit.events().await.unwrap_err();
+        assert!(refused.contains("line 2"), "{refused}");
+
+        // An unsigned log is read as it is.
+        let plain = temp_log("read-back-plain");
+        let audit = Audit::open(&plain, None).await.unwrap();
+        audit.record(None, json!({ "event": "a" })).await;
+        assert_eq!(audit.events().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
