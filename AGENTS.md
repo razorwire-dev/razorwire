@@ -67,6 +67,8 @@ examples/executor.py         a starting point for an executor, standard library 
 policy/policy.schema.json    JSON Schema for policy files
 policy/example.policy.yaml   example policy, also used by the unit tests
 install.sh, install.ps1      one-command install from a GitHub release
+site/                        the public landing page: static HTML, CSS and a
+                             little JS, no build step, not deployed yet
 .github/workflows/release.yml  release builds; runs only on a v* tag or by hand
 ```
 
@@ -416,6 +418,21 @@ with OpenSSL vendored (`--features vendored-openssl`). Publishing the draft
 is done by hand. `install.sh` and `install.ps1` download the latest release
 (or `RAZORWIRE_VERSION`), check it against `SHA256SUMS`, and need
 `GITHUB_TOKEN` while the repository is private.
+
+## The public site
+
+`site/index.html`, `site/styles.css`, `site/main.js` and `site/favicon.svg`
+make the landing page. There is no build step and no third-party script; a
+Content-Security-Policy meta tag allows only the site's own files and Google
+Fonts. The page works without JavaScript (tabs show every panel, copy
+buttons stay hidden). Light and dark follow the system. The terminal
+outputs on it come from real runs, so keep them and every claim true when
+behaviour changes. Links go to the GitHub repository, which is private
+until launch. To preview: `python -m http.server 8110 --directory site`.
+
+The dashboard (the paid control plane) is separate and not started. The
+plan is for Lovable to design its screens only, in its own private repo,
+with logins, data access, the API and the proxy's link to it written here.
 
 ## Conventions
 

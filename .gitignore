@@ -3,3 +3,4 @@ audit.jsonl
 executor.jsonl
 .env
 *.keys
+/.claude/launch.json

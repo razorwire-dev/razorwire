@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Razorwire: an action firewall for AI agents</title>
+<meta name="description" content="Razorwire checks every tool call an AI agent's model asks for against your rules. Dangerous calls are removed before the agent sees them, risky ones wait for a person, and every decision goes into a signed log you can undo from. Open source, written in Rust.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#eef1f4" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e1216" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Razorwire: an action firewall for AI agents">
+<meta property="og:description" content="Every tool call your agent's model asks for is checked against your rules first. Dangerous ones never reach the agent.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..900&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="styles.css">
+<script src="main.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top" aria-label="Razorwire, back to the top">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <rect width="64" height="64" rx="14" fill="#151b22"/>
+        <line x1="6" y1="32" x2="58" y2="32" stroke="#8995a2" stroke-width="4" stroke-linecap="round"/>
+        <line x1="21" y1="17" x2="43" y2="47" stroke="#f2b01e" stroke-width="6" stroke-linecap="round"/>
+        <line x1="43" y1="17" x2="21" y2="47" stroke="#f2b01e" stroke-width="6" stroke-linecap="round"/>
+      </svg>
+      <span>Razorwire</span>
+    </a>
+    <nav aria-label="Main">
+      <a class="wide" href="#how">How it works</a>
+      <a class="wide" href="#features">Features</a>
+      <a class="wide" href="#security">Security</a>
+      <a href="#install">Install</a>
+      <a class="nav-gh" href="https://github.com/razorwire-dev/razorwire">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="hero wrap" id="top">
+    <p class="eyebrow"><span class="dot" aria-hidden="true"></span>Early release · Open source · MIT</p>
+    <h1>An action firewall for <em>AI agents</em></h1>
+    <p class="sub">Your agent does whatever its model asks for. Razorwire sits in between and checks every tool call against your rules first. <strong>Dangerous calls are removed before the agent ever sees them</strong>, risky ones wait for a person, and every decision goes into a signed log you can undo from.</p>
+    <div class="ctas">
+      <a class="btn primary" href="#install">Install Razorwire</a>
+      <a class="btn" href="https://github.com/razorwire-dev/razorwire">Read the code</a>
+    </div>
+    <ul class="facts">
+      <li>Written in Rust</li>
+      <li>One program, nothing else to install</li>
+      <li>Any OpenAI-compatible API</li>
+    </ul>
+  </section>
+
+  <div class="wrap" aria-hidden="true">
+    <svg class="wire" viewBox="0 0 400 22" preserveAspectRatio="none">
+      <defs>
+        <pattern id="barb" width="40" height="22" patternUnits="userSpaceOnUse">
+          <line x1="0" y1="11" x2="40" y2="11" stroke="currentColor" stroke-width="1.5"/>
+          <line x1="14" y1="4" x2="26" y2="18" stroke="currentColor" stroke-width="1.5"/>
+          <line x1="26" y1="4" x2="14" y2="18" stroke="currentColor" stroke-width="1.5"/>
+        </pattern>
+      </defs>
+      <rect width="400" height="22" fill="url(#barb)"/>
+    </svg>
+  </div>
+
+  <section class="section wrap" aria-labelledby="demo-h">
+    <div class="section-head">
+      <p class="label">A real run · a real model</p>
+      <h2 id="demo-h">An agent told to drop two databases</h2>
+      <p class="lede">The agent runs whatever tool calls come back, with no checks of its own. One rule is the difference.</p>
+    </div>
+    <div class="pair">
+      <div class="term">
+        <div class="term-head"><span class="label">Without Razorwire</span><span class="verdict bad">Production lost</span></div>
+<pre><span class="who">OPERATOR</span>We are out of disk space. Drop the staging database and the production database.
+<span class="who">AGENT</span>calls db_drop("staging")
+<span class="who">DATABASE</span><span class="gone">staging has been DELETED</span>
+<span class="who">AGENT</span>calls db_drop("production")
+<span class="who">DATABASE</span><span class="gone">production has been DELETED</span>
+
+<span class="who">RESULT</span><span class="gone">production: DELETED</span>
+<span class="who">RESULT</span><span class="gone">staging: DELETED</span></pre>
+      </div>
+      <div class="term">
+        <div class="term-head"><span class="label">With Razorwire</span><span class="verdict good">Production safe</span></div>
+<pre><span class="who">OPERATOR</span>We are out of disk space. Drop the staging database and the production database.
+<span class="who">AGENT</span>calls db_drop("staging")
+<span class="who">DATABASE</span><span class="gone">staging has been DELETED</span>
+<span class="note">[razorwire] Blocked tool call "db_drop": Dropping the production database is blocked by policy. (rule: no-production-db-drop)</span>
+<span class="who">RESULT</span><span class="kept">production: still there</span>
+<span class="who">RESULT</span><span class="gone">staging: DELETED</span></pre>
+      </div>
+    </div>
+    <div class="rule-row">
+      <div class="explain">
+        <h3>The model still asked for it</h3>
+        <p>Razorwire took the call out of the model's reply, so the agent had nothing to run. The note tells the model which rule stopped it, so it can change course instead of trying again.</p>
+      </div>
+      <div class="code">
+        <div class="file"><span>policy.yaml</span></div>
+<pre><code><span class="c"># the rule that saved production</span>
+- <span class="k">id</span>: no-production-db-drop
+  <span class="k">match</span>:
+    <span class="k">tool</span>: db_drop
+  <span class="k">when</span>: <span class="hl">args.database == "production"</span>
+  <span class="k">action</span>: deny
+  <span class="k">message</span>: <span class="s">Dropping the production database is blocked by policy.</span></code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="section wrap" id="how" aria-labelledby="how-h">
+    <div class="section-head">
+      <p class="label">How it works</p>
+      <h2 id="how-h">One line puts it in front of your agent</h2>
+      <p class="lede">Point your SDK at Razorwire instead of the provider. Nothing else in your agent changes.</p>
+    </div>
+    <div class="code">
+      <div class="file"><span>agent.py</span></div>
+<pre><code><span class="k">from</span> openai <span class="k">import</span> OpenAI
+
+client = OpenAI(base_url=<span class="hl">"http://127.0.0.1:8080/v1"</span>)</code></pre>
+    </div>
+    <div class="flow" role="img" aria-label="The agent talks to Razorwire, Razorwire talks to the model, and only allowed tool calls come back to the agent.">
+      <div class="node">
+        <h3>Your agent</h3>
+        <p>Runs the tool calls that come back. It holds the real access: databases, payments, email.</p>
+      </div>
+      <div class="arrow" aria-hidden="true">⇄</div>
+      <div class="node guard">
+        <h3>Razorwire</h3>
+        <p>Reads every tool call in the model's reply, checks it against your rules, removes or holds the ones that break them, and logs every decision.</p>
+      </div>
+      <div class="arrow" aria-hidden="true">⇄</div>
+      <div class="node">
+        <h3>The model</h3>
+        <p>OpenAI, Groq or any provider with the same API. Decides which tools to call.</p>
+      </div>
+    </div>
+    <ol class="steps">
+      <li>
+        <h3>Check</h3>
+        <p>Each tool call is matched against your rules, top to bottom, and the first match decides: allow, deny or review. Rules can read the tool, its arguments, the agent's name and how the run has gone so far.</p>
+      </li>
+      <li>
+        <h3>Decide</h3>
+        <p>A denied call is removed from the reply, with a note naming the rule. A call under review waits for a person with an admin key. Anything that cannot be checked is blocked.</p>
+      </li>
+      <li>
+        <h3>Record</h3>
+        <p>Every call and decision goes into an audit log, each line sealed to the one before it, so an edited or deleted line shows. When something that went through was wrong, rollback undoes it.</p>
+      </li>
+    </ol>
+  </section>
+
+  <section class="section wrap" id="features" aria-labelledby="features-h">
+    <div class="section-head">
+      <p class="label">Features</p>
+      <h2 id="features-h">Brakes, a person in the loop, and an undo button</h2>
+    </div>
+    <div class="grid">
+      <article class="card">
+        <span class="label">Rules</span>
+        <h3>Plain YAML you can read</h3>
+        <p>Match a tool by name, test its arguments with a short expression, and allow, deny or hold it. Start in shadow mode to see what would be blocked before anything is.</p>
+      </article>
+      <article class="card">
+        <span class="label">Loop guard</span>
+        <h3>Stops a stuck agent</h3>
+        <p>Razorwire counts what already happened in the run, such as calls, repeats, streaks and blocks, so a rule can stop an agent that loops or runs over budget.</p>
+      </article>
+      <article class="card">
+        <span class="label">Approval</span>
+        <h3>Risky calls wait for you</h3>
+        <p>Approve or deny from the terminal, or from another computer over https. A second person can hold their own admin key, and every decision says who made it.</p>
+      </article>
+      <article class="card">
+        <span class="label">Approve later</span>
+        <h3>Nobody there? It waits a week</h3>
+        <p>A call nobody answered in time is parked for 7 days instead of thrown away. Approve it when you are back and it is carried out then. It survives a restart.</p>
+      </article>
+      <article class="card">
+        <span class="label">Rollback</span>
+        <h3>Undo what already ran</h3>
+        <p>Your rules say how to reverse each tool. Razorwire works out the plan from its signed log, shows it first, and undoes newest first, stopping at the first failure.</p>
+      </article>
+      <article class="card">
+        <span class="label">Streaming</span>
+        <h3>Replies stay word by word</h3>
+        <p>Text reaches your agent as it arrives. The moment a tool call starts, the rest of the reply is held until the whole of it has been checked.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section wrap" aria-labelledby="see-h">
+    <div class="section-head">
+      <p class="label">See it work</p>
+      <h2 id="see-h">Three more real runs</h2>
+    </div>
+    <div class="tabs" data-tabs>
+      <div role="tablist" aria-label="Demos" hidden>
+        <button role="tab" id="tab-loop" aria-controls="panel-loop" type="button">A stuck agent</button>
+        <button role="tab" id="tab-refund" aria-controls="panel-refund" type="button">A $750 refund</button>
+        <button role="tab" id="tab-undo" aria-controls="panel-undo" type="button">Undo</button>
+      </div>
+
+      <div role="tabpanel" id="panel-loop" aria-labelledby="tab-loop">
+        <h3 class="panel-title">A stuck agent</h3>
+        <p class="panel-note">Told to wait for a deploy that never finishes, the agent checks forever, and every check costs money. The loop guard stops it after two identical calls in a row.</p>
+        <div class="pair">
+          <div class="term">
+            <div class="term-head"><span class="label">Without Razorwire</span><span class="verdict bad">Never stops</span></div>
+<pre><span class="who">OPERATOR</span>Deploy 42 is rolling out. Check its status until it has finished, then tell me.
+<span class="who">AGENT</span>calls deploy_status(42)
+<span class="who">DEPLOY</span>42 is still pending
+<span class="who">AGENT</span>calls deploy_status(42)
+<span class="who">DEPLOY</span>42 is still pending
+<span class="dim">… ten more identical checks …</span>
+
+<span class="who">RESULT</span><span class="gone">deploy_status was called 12 times</span>
+<span class="who">RESULT</span><span class="gone">still going when the demo cut it off</span></pre>
+          </div>
+          <div class="term">
+            <div class="term-head"><span class="label">With Razorwire</span><span class="verdict good">Stopped after 2</span></div>
+<pre><span class="who">OPERATOR</span>Deploy 42 is rolling out. Check its status until it has finished, then tell me.
+<span class="who">AGENT</span>calls deploy_status(42)
+<span class="who">DEPLOY</span>42 is still pending
+<span class="who">AGENT</span>calls deploy_status(42)
+<span class="who">DEPLOY</span>42 is still pending
+<span class="note">[razorwire] Blocked tool call "deploy_status": This exact call was just made twice in a row, so the agent looks stuck. Stop and report back instead of retrying. (rule: stuck-in-a-loop)</span>
+<span class="who">RESULT</span><span class="kept">deploy_status was called 2 times</span>
+<span class="who">RESULT</span><span class="kept">the agent stopped</span></pre>
+          </div>
+        </div>
+      </div>
+
+      <div role="tabpanel" id="panel-refund" aria-labelledby="tab-refund">
+        <h3 class="panel-title">A $750 refund</h3>
+        <p class="panel-note">Refunds above 500 are held for a person. The model asked for $750 twice: one was approved and went out; the other was denied, and the agent was told who said no and why.</p>
+        <div class="pair">
+          <div class="term">
+            <div class="term-head"><span class="label">You approve</span><span class="verdict good">Refund goes out</span></div>
+<pre><span class="cmd">$ razorwire approvals</span>
+1 tool call is waiting for approval:
+
+  apr_b799…  stripe_refund  agent: support-bot  rule: refund-cap
+      arguments: {"amount":750,"order":"A-17"}
+      why held:  Refunds above 500 are held for human approval.
+
+<span class="cmd">$ razorwire approve apr_b799… checked with the customer</span>
+<span class="kept">Approved apr_b799…: stripe_refund for agent support-bot.</span></pre>
+          </div>
+          <div class="term">
+            <div class="term-head"><span class="label">You deny</span><span class="verdict good">Agent never gets it</span></div>
+<pre><span class="cmd">$ razorwire deny apr_0a5c… already refunded last week</span>
+<span class="gone">Denied apr_0a5c…: stripe_refund for agent support-bot.</span>
+
+<span class="note">[razorwire] Blocked tool call "stripe_refund": Refunds above 500 are held for human approval. Denied by mann: already refunded last week. (rule: refund-cap)</span>
+<span class="who">MODEL</span>I'm unable to process a $750 refund automatically. I'll forward this request for manual review.</pre>
+          </div>
+        </div>
+      </div>
+
+      <div role="tabpanel" id="panel-undo" aria-labelledby="tab-undo">
+        <h3 class="panel-title">Undo</h3>
+        <p class="panel-note">Rollback shows its plan first and changes nothing until you add <code>--run</code>. The undo itself is carried out by a small service you run, which holds the real credentials. Every request to it is signed.</p>
+        <div class="pair">
+          <div class="term">
+            <div class="term-head"><span class="label">Look first</span><span class="verdict good">Nothing touched</span></div>
+<pre><span class="cmd">$ razorwire rollback --agent support-bot</span>
+3 actions went through, newest first:
+
+db_drop  {"database":"staging"}
+  <span class="gone">cannot be undone: the policy has no undo recipe for db_drop</span>
+
+grant_role  {"role":"admin","user":"u1"}
+  <span class="kept">undo: revoke_role {"role":"admin","user":"u1"}</span>
+
+create_ticket  {"title":"refund request"}
+  <span class="kept">undo: close_ticket {"id":812, …}</span>
+
+Nothing was undone yet.</pre>
+          </div>
+          <div class="term">
+            <div class="term-head"><span class="label">Then undo</span><span class="verdict good">2 undone</span></div>
+<pre><span class="cmd">$ razorwire rollback --agent support-bot --run</span>
+<span class="gone">cannot undo  db_drop</span>
+<span class="kept">undone       grant_role     → revoke_role</span>
+<span class="kept">undone       create_ticket  → close_ticket</span>
+
+Undid 2.
+
+<span class="dim">Run it again and both are skipped: already undone.</span></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section wrap" id="security" aria-labelledby="security-h">
+    <div class="section-head">
+      <p class="label">Security</p>
+      <h2 id="security-h">Built like a security product, because it is one</h2>
+      <p class="lede">No software is unbreakable. Razorwire closes the known ways in, blocks whatever it cannot check, and makes tampering visible.</p>
+    </div>
+    <ul class="locks">
+      <li><b>A key for every agent</b><span>An agent's name comes from its key, so it cannot claim another agent's looser rules. Keys are stored only as hashes.</span></li>
+      <li><b>The provider key stays inside</b><span>Agents hold only a Razorwire key, so they cannot go around Razorwire to the model.</span></li>
+      <li><b>Agents cannot approve themselves</b><span>Agent keys and admin keys never mix. Approving always takes a person.</span></li>
+      <li><b>Fails closed</b><span>A rule that errors, a reply it cannot read, a held call nobody decided: all blocked.</span></li>
+      <li><b>Refuses unsafe setups</b><span>It will not open to the network without keys, or talk to a remote provider over plain http.</span></li>
+      <li><b>Small and strict</b><span>No unsafe Rust, no crashing on bad input, and keys never appear in a log or on screen.</span></li>
+    </ul>
+    <div class="honest">
+      <h3>What it does not do</h3>
+      <ul>
+        <li>It only sees traffic that goes through it. Your network should stop the agent reaching the provider directly.</li>
+        <li>It checks tool calls in OpenAI-compatible replies. Tools the provider runs itself, such as web search, are not checked.</li>
+        <li>It does what your rules say. Start new rules in shadow mode and read the log first.</li>
+      </ul>
+      <p><a href="https://github.com/razorwire-dev/razorwire/blob/main/SECURITY.md">Read the full threat model in SECURITY.md</a></p>
+    </div>
+  </section>
+
+  <section class="section wrap" aria-labelledby="works-h">
+    <div class="section-head">
+      <p class="label">Works with</p>
+      <h2 id="works-h">Tested with the tools agents are built on</h2>
+      <p class="lede">Both API styles, streamed and not. Anything that speaks the OpenAI API can sit behind it.</p>
+    </div>
+    <ul class="chips">
+      <li>OpenAI Python SDK</li>
+      <li>Chat Completions</li>
+      <li>Responses API</li>
+      <li>LangChain and LangGraph</li>
+      <li>CrewAI</li>
+      <li>Groq</li>
+      <li>OpenAI</li>
+    </ul>
+  </section>
+
+  <section class="section wrap" id="install" aria-labelledby="install-h">
+    <div class="section-head">
+      <p class="label">Install</p>
+      <h2 id="install-h">One command</h2>
+      <p class="lede">The installer downloads the build for your machine and checks it against the release's checksums before installing anything.</p>
+    </div>
+    <div class="install">
+      <div class="tabs" data-tabs>
+        <div role="tablist" aria-label="Operating system" hidden>
+          <button role="tab" id="tab-unix" aria-controls="panel-unix" type="button">macOS and Linux</button>
+          <button role="tab" id="tab-win" aria-controls="panel-win" type="button">Windows</button>
+        </div>
+        <div role="tabpanel" id="panel-unix" aria-labelledby="tab-unix">
+          <h3 class="panel-title">macOS and Linux</h3>
+          <div class="code">
+            <div class="file"><span>Terminal</span><button class="copy" type="button" data-copy hidden>Copy</button></div>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/razorwire-dev/razorwire/main/install.sh | sh</code></pre>
+          </div>
+        </div>
+        <div role="tabpanel" id="panel-win" aria-labelledby="tab-win">
+          <h3 class="panel-title">Windows</h3>
+          <div class="code">
+            <div class="file"><span>PowerShell</span><button class="copy" type="button" data-copy hidden>Copy</button></div>
+<pre><code>irm https://raw.githubusercontent.com/razorwire-dev/razorwire/main/install.ps1 | iex</code></pre>
+          </div>
+        </div>
+        <p class="small">Builds for Linux (x86_64, any distribution), macOS (Apple silicon and Intel) and Windows (x86_64). Anywhere else, build it with <code>cargo install --path .</code></p>
+      </div>
+      <ol class="then">
+        <li><b>Write a policy</b><span>Start from the example policy in the repository. <code>razorwire check-policy</code> tells you if it is valid.</span></li>
+        <li><b>Start the proxy</b><span>Set <code>POLICY_FILE</code> and your provider's <code>UPSTREAM_URL</code>, then run <code>razorwire</code>.</span></li>
+        <li><b>Point your agent at it</b><span>Change the base URL to <code>http://127.0.0.1:8080/v1</code>. Blocked calls start showing up in <code>audit.jsonl</code>.</span></li>
+      </ol>
+    </div>
+  </section>
+
+  <div class="wrap">
+    <section class="closing" aria-labelledby="closing-h">
+      <h2 id="closing-h">Free and open source</h2>
+      <p>The whole firewall is MIT licensed. A hosted dashboard for teams is on the way: approve held calls from any browser, and see your logs, rules and keys in one place.</p>
+      <div class="ctas">
+        <a class="btn" href="#install">Install Razorwire</a>
+        <a class="btn ghost" href="https://github.com/razorwire-dev/razorwire">Star it on GitHub</a>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <span>Razorwire · MIT licence</span>
+    <nav aria-label="Footer">
+      <a href="https://github.com/razorwire-dev/razorwire">GitHub</a>
+      <a href="https://github.com/razorwire-dev/razorwire/blob/main/SECURITY.md">Security</a>
+      <a href="https://github.com/razorwire-dev/razorwire/blob/main/LICENSE">Licence</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>
