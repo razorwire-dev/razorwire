@@ -5,6 +5,7 @@
 //! keys, check files, and drive the admin API.
 
 mod admin;
+mod alerts;
 mod approvals;
 mod audit;
 mod auth;
@@ -53,6 +54,8 @@ Usage:
                                    show what agents did and how it would be undone;
                                    with --run, undo it, newest first
   razorwire new-executor-key       create a key for signing requests to the executor
+  razorwire test-alert             send a test alert to ALERT_URL
+  razorwire new-alert-key          create a key for signing json alerts
 
 The proxy is configured with environment variables:
   UPSTREAM_URL            provider to forward to (default https://api.openai.com)
@@ -69,6 +72,12 @@ The proxy is configured with environment variables:
   EXECUTOR_URL, EXECUTOR_KEY
                           a service that carries out undos and parked calls;
                           turns on rollback and approve-later
+  ALERT_URL               where to send an alert when a call is held: a Slack or
+                          Discord webhook, an ntfy topic, or any https address
+  ALERT_FORMAT            json, slack, discord or ntfy (default: from the address)
+  ALERT_EVENTS            held,parked,expired (default); add blocked, or say all
+  ALERT_ARGUMENTS         show (default) or hide the call's arguments in alerts
+  ALERT_KEY               signs json alerts, like requests to the executor
 
 The admin commands use RAZORWIRE_URL (default http://127.0.0.1:8080),
 RAZORWIRE_ADMIN_KEY, and RAZORWIRE_CA_CERT to trust a self-signed certificate.
@@ -97,6 +106,8 @@ async fn main() {
         },
         Some("rollback") => rollback(rest).await,
         Some("new-executor-key") => new_executor_key(),
+        Some("test-alert") => test_alert().await,
+        Some("new-alert-key") => new_alert_key(),
         Some("help" | "--help" | "-h") => {
             print!("{HELP}");
             Ok(())
@@ -178,8 +189,10 @@ async fn serve() -> Result<(), String> {
         (None, None) => None,
         _ => return Err("set both EXECUTOR_URL and EXECUTOR_KEY, or neither".into()),
     };
+    let alert_target = alerts::Target::from_settings(setting)?;
 
     let audit = Arc::new(Audit::open(&audit_path, audit_key).await?);
+    let alerts = alert_target.map(|target| Arc::new(alerts::Alerts::start(target, audit.clone())));
     let signed = audit.signed().await;
     let agent_keys = keys.count(Role::Agent);
     let admin_keys = keys.count(Role::Admin);
@@ -248,6 +261,17 @@ async fn serve() -> Result<(), String> {
         ),
         None => println!("executor: none (rollback only shows its plan; held calls that time out are blocked)"),
     }
+    match &alerts {
+        Some(alerts) => {
+            println!("alerts: {}", alerts.describe());
+            if admin_keys == 0 {
+                println!(
+                    "  no admin key, so no call is ever held: only `blocked` alerts can go out."
+                );
+            }
+        }
+        None => println!("alerts: none (set ALERT_URL to be told when a call is held)"),
+    }
     println!(
         "audit log: {audit_path} ({})",
         if signed {
@@ -269,7 +293,8 @@ async fn serve() -> Result<(), String> {
     let config = Config { policy, keys };
     let summary = config.summary();
     let has_executor = executor.is_some();
-    let state = Arc::new(AppState::new(settings, config, audit, executor)?);
+    let has_alerts = alerts.is_some();
+    let state = Arc::new(AppState::new(settings, config, audit, executor, alerts)?);
     if has_executor {
         // Calls parked before a restart can still be decided.
         match state.audit.events().await {
@@ -291,6 +316,7 @@ async fn serve() -> Result<(), String> {
         "signed": signed,
         "tls": tls.is_some(),
         "executor": has_executor,
+        "alerts": has_alerts,
     });
     state.record(None, started).await;
 
@@ -521,6 +547,28 @@ fn new_executor_key() -> Result<(), String> {
     );
     println!("which uses it to check that a request really came from Razorwire.");
     println!("Keep it secret: anyone who has it can ask the executor to act.");
+    Ok(())
+}
+
+async fn test_alert() -> Result<(), String> {
+    let target = alerts::Target::from_settings(setting)?
+        .ok_or("set ALERT_URL to the address alerts go to: a Slack or Discord webhook, an ntfy topic, or your own https endpoint")?;
+    let shown = target.describe();
+    target
+        .send_test()
+        .await
+        .map_err(|err| format!("the test alert to {shown} failed: {err}"))?;
+    println!("Sent a test alert to {shown}.");
+    println!("If it did not arrive, check ALERT_URL, and ALERT_FORMAT if the address is your own.");
+    Ok(())
+}
+
+fn new_alert_key() -> Result<(), String> {
+    let key = audit::generate_key()?;
+    println!("{key}\n");
+    println!("Set ALERT_KEY to this value for Razorwire, and give the same value to whatever");
+    println!("receives the json alerts, so it can check that an alert really came from Razorwire.");
+    println!("Slack, Discord and ntfy cannot check it; it is for json alerts only.");
     Ok(())
 }
 

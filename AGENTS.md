@@ -61,6 +61,8 @@ src/openai.rs                find tool calls in provider payloads, plan and appl
 src/sse.rs                   streamed replies: the live gate, reassembly, rebuilding
 src/tls.rs                   serving https: certificate loading, handshakes
 src/executor.rs              signed requests to the executor
+src/alerts.rs                alerts when a call is held: Slack, Discord, ntfy, json;
+                             the queue, the rate limit and the sender task
 src/rollback.rs              the rollback plan, worked out from the audit log
 examples/demo_agent.rs       reckless agents: one drops databases, one gets stuck polling
 examples/executor.py         a starting point for an executor, standard library only
@@ -232,6 +234,45 @@ loopback, no redirects, 60-second limit, answer capped at 16 KB) with
 "reason"}`. A retry reuses the id. 2xx means done. `examples/executor.py`
 checks the signature and a 5-minute window and never runs an id twice.
 
+## Alerts
+
+`alerts::Target::from_settings` reads `ALERT_URL` (https unless on loopback,
+no user name or password, never printed: the banner and errors show only
+scheme and host), `ALERT_FORMAT` (`json`, `slack`, `discord`, `ntfy`;
+guessed from `hooks.slack.com`, `discord.com/api/webhooks/` and `ntfy.sh`,
+otherwise json), `ALERT_EVENTS` (default `held,parked,expired`; `blocked`
+or `all` on request), `ALERT_ARGUMENTS` (`show` or `hide`) and `ALERT_KEY`
+(json only; refused with the other formats). Any `ALERT_*` setting without
+`ALERT_URL`, or an invalid one, stops startup.
+
+`alerts::Alerts::notify` never waits: it puts the alert on a queue of 256
+with `try_send`, and a full queue counts it as dropped. One task sends them
+in order, at most 20 per minute; at the end of a minute with alerts held
+back or dropped, it logs `alerts_dropped` and sends one summary. Each alert
+has an `alr_` id that every try reuses. A network error, 429 or 5xx is
+tried up to 3 times (2 s, then 5 s, or the receiver's `Retry-After` up to
+30 s); after that, or on any other status, `alert_failed` is logged. Errors
+are scrubbed of the URL's path and query.
+
+Where they come from: `Approvals::hold` raises `held`, `Approvals::park`
+raises `parked` (on a timeout or a hang-up), `Ticket::wait` and the
+ticket's `Drop` raise `expired` with `why` `timeout` or `withdrawn` when
+nothing is parked, and the clean-up of parked calls raises `expired` with
+`why: parked` after 7 days. `proxy::police` raises `blocked` for each
+`tool_call` event with `blocked: true`, only when `blocked` is turned on.
+
+Names, commands and arguments are code in Slack and Discord, with
+backticks swapped for `ˋ`; Slack escapes `& < >` everywhere, Discord
+escapes markdown in prose and sends `allowed_mentions: {"parse": []}` and
+`flags: 4`. Control, direction and zero-width characters become spaces.
+Arguments are cut to 2,500 bytes (1,000 for Discord, which caps messages
+at 2,000 characters). ntfy gets plain text with `title` and `priority`
+headers. json gets `{"id", "kind", "title", "text", "created_ms",
+"approval_id", "agent", "tool", "rule", "message", "arguments",
+"until_ms", "why" or "count"}`, signed with `ALERT_KEY` like an executor
+request. `razorwire test-alert` sends one now and reports the receiver's
+answer.
+
 ## Policy files
 
 Format: `policy/policy.schema.json`. Example: `policy/example.policy.yaml`.
@@ -266,6 +307,8 @@ One JSON object per line in `audit.jsonl`:
   `rollback_finished`.
 - `auth_failed` (never with the key), and `auth_failures_suppressed` when
   more than 20 a minute were not logged.
+- `alert_failed` (with `alert_id`, `kind`, `approval_id` and `reason`,
+  never the URL), and `alerts_dropped` with a `count`.
 - `proxy_started`, `config_reloaded`, `reload_failed`, `response_refused`.
 
 With `AUDIT_KEY` (hex, at least 32 bytes; `razorwire new-audit-key`), each
@@ -309,6 +352,9 @@ Unicode direction marks are escaped as `\uXXXX` in every line.
   detected from the file. Someone with `AUDIT_KEY` can forge the log.
 - **Bypass.** An agent that can reach the provider directly skips the proxy.
   `UPSTREAM_API_KEY` takes away the key; the network must take away the route.
+- **Alerts are best effort.** One that fails 3 times is logged, not sent
+  later; over 20 a minute are only counted. Slack, Discord and ntfy alerts
+  are unsigned, and once sent they live at the third party.
 
 ## Run it
 
@@ -331,13 +377,18 @@ Environment variables:
 | `TLS_CERT`, `TLS_KEY` | unset | Both or neither: serve https |
 | `STREAM_MODE` | `live` | `live` or `hold`, for streamed replies under enforcement |
 | `EXECUTOR_URL`, `EXECUTOR_KEY` | unset | Both or neither: rollback and parked calls |
+| `ALERT_URL` | unset | Where alerts go. Never printed in full |
+| `ALERT_FORMAT` | from the host | `json`, `slack`, `discord` or `ntfy` |
+| `ALERT_EVENTS` | `held,parked,expired` | Add `blocked`, or `all` |
+| `ALERT_ARGUMENTS` | `show` | `hide` keeps arguments out of alerts |
+| `ALERT_KEY` | unset | Hex, at least 32 bytes: signs json alerts |
 
 Commands: `razorwire [serve]`, `new-key <agent|admin> <name>`, `keys`,
 `revoke-key <name> [fingerprint]`, `new-audit-key`, `new-executor-key`,
-`check-policy <file>`, `verify-log [file]`, `approvals`,
+`new-alert-key`, `check-policy <file>`, `verify-log [file]`, `approvals`,
 `approve <id> [reason]`, `deny <id> [reason]`, `reload`,
 `rollback [--agent <name>] [--since 30m|2h|1d] [<undo id>...] [--run]`,
-`help`. The admin commands use `RAZORWIRE_URL` (default
+`test-alert`, `help`. The admin commands use `RAZORWIRE_URL` (default
 `http://127.0.0.1:8080`, https required for anything not on loopback),
 `RAZORWIRE_ADMIN_KEY`, and `RAZORWIRE_CA_CERT` for a self-signed certificate.
 
@@ -400,13 +451,13 @@ without keys, so the demo proxy must not have agent keys set up.
 |---|---|
 | 1-2 | Proxy intercepts and logs tool calls. Done. Repo is private until launch |
 | 3-4 | Policy engine: YAML rules that block an action, and the demo. Done. Loop guard, approvals, keys, signed log and reload: done |
-| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later. Done. Python SDK, LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
+| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held. Done. Python SDK, LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
 | 7 | Rollback through an executor: done. Show HN launch |
 | 8 | Hosted control plane and Stripe billing |
 
 Next up, in order: cut the first release (`git tag v0.1.0`, push the tag),
-notifications when a call is held, the Python SDK, verification (stage 3),
-public-key signatures and export for the audit log (stage 4).
+the Python SDK, verification (stage 3), public-key signatures and export
+for the audit log (stage 4).
 
 ## Releases
 

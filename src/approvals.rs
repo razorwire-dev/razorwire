@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use crate::{
+    alerts::{Alerts, Kind},
     audit::{now_ms, Audit},
     auth::hex,
 };
@@ -86,17 +87,44 @@ pub struct Approvals {
     /// Calls are parked only when an executor can carry them out later.
     parking: bool,
     audit: Arc<Audit>,
+    /// Tells a person when a call is held, parked, or ends undecided.
+    alerts: Option<Arc<Alerts>>,
 }
 
 impl Approvals {
-    pub fn new(limit: usize, audit: Arc<Audit>, parking: bool) -> Approvals {
+    pub fn new(
+        limit: usize,
+        audit: Arc<Audit>,
+        parking: bool,
+        alerts: Option<Arc<Alerts>>,
+    ) -> Approvals {
         Approvals {
             pending: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
             limit,
             parking,
             audit,
+            alerts,
         }
+    }
+
+    /// Queue an alert about one call. Never waits.
+    fn alert(&self, kind: Kind, id: &str, summary: &Value, extra: Value) {
+        let Some(alerts) = &self.alerts else {
+            return;
+        };
+        let mut details = json!({
+            "approval_id": id,
+            "agent": summary["agent"],
+            "tool": summary["tool"],
+            "rule": summary["rule"],
+            "message": summary["message"],
+            "arguments": summary["arguments"],
+        });
+        if let (Some(fields), Value::Object(extra)) = (details.as_object_mut(), extra) {
+            fields.extend(extra);
+        }
+        alerts.notify(kind, details);
     }
 
     fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, Pending>> {
@@ -113,7 +141,10 @@ impl Approvals {
             .map(|(id, _)| id.clone())
             .collect();
         for id in expired {
-            parked.remove(&id);
+            if let Some(call) = parked.remove(&id) {
+                let why = json!({ "why": "parked" });
+                self.alert(Kind::Expired, &id, &call.summary, why);
+            }
             let event = json!({
                 "event": "approval_decided",
                 "approval_id": id,
@@ -146,6 +177,8 @@ impl Approvals {
         if pending.len() >= self.limit {
             return Err(HoldError::Full);
         }
+        let until = json!({ "until_ms": summary["expires_ms"] });
+        self.alert(Kind::Held, &id, &summary, until);
         pending.insert(
             id.clone(),
             Pending {
@@ -154,6 +187,7 @@ impl Approvals {
                 reply,
             },
         );
+        drop(pending);
         Ok(Ticket {
             id,
             approvals: self,
@@ -186,6 +220,7 @@ impl Approvals {
             "created_ms": summary["created_ms"],
             "parked_until_ms": until_ms,
         });
+        self.alert(Kind::Parked, id, &summary, json!({ "until_ms": until_ms }));
         parked.insert(
             id.to_string(),
             Parked {
@@ -319,13 +354,20 @@ impl Ticket<'_> {
         self.wait = None;
         let left = self.approvals.pending().remove(&self.id);
         match (outcome, left) {
-            (Outcome::Expired, Some(pending)) => match self.approvals.park(&self.id, pending) {
-                Some(event) => {
-                    self.approvals.audit.record(None, event).await;
-                    Outcome::Parked
+            (Outcome::Expired, Some(pending)) => {
+                let summary = pending.summary.clone();
+                match self.approvals.park(&self.id, pending) {
+                    Some(event) => {
+                        self.approvals.audit.record(None, event).await;
+                        Outcome::Parked
+                    }
+                    None => {
+                        let why = json!({ "why": "timeout" });
+                        self.approvals.alert(Kind::Expired, &self.id, &summary, why);
+                        Outcome::Expired
+                    }
                 }
-                None => Outcome::Expired,
-            },
+            }
             (outcome, _) => outcome,
         }
     }
@@ -343,7 +385,14 @@ impl Drop for Ticket<'_> {
             return;
         };
         let mut events = vec![json!({ "event": "approval_abandoned", "approval_id": self.id })];
-        events.extend(self.approvals.park(&self.id, pending));
+        let summary = pending.summary.clone();
+        match self.approvals.park(&self.id, pending) {
+            Some(event) => events.push(event),
+            None => {
+                let why = json!({ "why": "withdrawn" });
+                self.approvals.alert(Kind::Expired, &self.id, &summary, why);
+            }
+        }
         let audit = self.approvals.audit.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
@@ -388,7 +437,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("razorwire-approvals-{}.jsonl", std::process::id()));
         let audit = Audit::open(&path.to_string_lossy(), None).await.unwrap();
-        Approvals::new(limit, Arc::new(audit), false)
+        Approvals::new(limit, Arc::new(audit), false, None)
     }
 
     /// A store that parks calls, with its own log.
@@ -399,7 +448,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let audit = Arc::new(Audit::open(&path.to_string_lossy(), None).await.unwrap());
-        (Approvals::new(10, audit.clone(), true), audit)
+        (Approvals::new(10, audit.clone(), true, None), audit)
     }
 
     fn refund() -> Value {

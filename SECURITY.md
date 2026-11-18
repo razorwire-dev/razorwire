@@ -20,11 +20,15 @@ and to make tampering visible.
 | Text from the model tries to trick the operator's terminal | Control characters and Unicode direction marks are escaped in log lines and in `razorwire approvals`. Reasons typed by an approver are cleaned the same way. |
 | A flood of requests | Request bodies are capped at 32 MB (16 KB on the admin API). At most 512 requests run at once; more get 503. At most 256 calls wait for approval at once. Failed key checks are logged at most 20 times a minute. A provider that goes silent for 10 minutes is given up on. |
 | The admin key crosses a network in the clear | The admin commands refuse a plain-http `RAZORWIRE_URL` unless it points at this machine. With `TLS_CERT` and `TLS_KEY`, Razorwire serves https itself (TLS 1.2 or later). A slow TLS handshake is cut off after 10 seconds, and at most 256 run at once. |
-| A bad config silently turns protection off | A policy, keys file, audit key, certificate or executor setting that is missing or invalid stops the proxy from starting. A reload that finds an invalid file changes nothing. |
+| A bad config silently turns protection off | A policy, keys file, audit key, certificate, executor or alert setting that is missing or invalid stops the proxy from starting. A reload that finds an invalid file changes nothing. |
 | A streamed reply slips a tool call through while it is still arriving | Under enforcement, only events known to carry nothing but text go out as they arrive. From the first event that could carry a tool call, or that is not understood, everything is held until the whole reply is checked. A stream that cannot be read, or that is cut off, ends with an error instead of the rest. |
 | Someone forges a request to the executor | Every request is signed with HMAC-SHA256 over a timestamp and the body, using `EXECUTOR_KEY`. The example executor refuses a bad signature or a timestamp more than 5 minutes off, and never runs the same id twice. `EXECUTOR_URL` must be https unless it is on this machine, and redirects are not followed. |
 | A rollback acts on a doctored log | Rollback and the restore of parked calls read the signed audit log, and refuse it if any line fails its check. The calls and arguments they act on come from the log, not from anything an agent sends. |
 | Two admins carry out the same thing twice | A parked call is taken out while it runs, and one rollback runs at a time. A step that was undone is recorded and skipped next time. |
+| An alert leaks its webhook address | `ALERT_URL` is never printed or logged; the banner and every error show only its scheme and host. It must be https unless it is on this machine, it may not carry a user name or password, and redirects are not followed. |
+| Text from the model tricks an approver through an alert | Names and arguments go into an alert as code, with backticks swapped for a look-alike so they cannot end the code early. Slack gets `&`, `<` and `>` escaped everywhere, so nothing can make a link or mention anyone. Discord gets mentions and link previews turned off. Control characters, direction marks and zero-width characters are replaced. An alert carries no power: approving still needs an admin key. |
+| A flood of held or blocked calls floods the alert channel | At most 20 alerts go out a minute. The rest are counted, logged as `alerts_dropped`, and summed up in one message. The queue holds 256 and never makes a request wait; a full queue drops and counts. A receiver that is down is tried 3 times, then `alert_failed` is logged. |
+| Someone forges an alert | JSON alerts can be signed with `ALERT_KEY`, the same way as requests to the executor. Slack, Discord and ntfy cannot check a signature, and `ALERT_KEY` is refused with them rather than silently ignored. |
 | A revoked person keeps approving | `razorwire revoke-key` removes the key and reloads the running proxy when it can, and says so plainly when it cannot. |
 
 ## What it does not protect against
@@ -53,6 +57,17 @@ and to make tampering visible.
 - **Approving a parked call later.** Its arguments are the ones the model
   asked for back then. The world may have changed since; check before you
   approve.
+- **What an alert says, once it is sent.** Slack, Discord, ntfy or your own
+  endpoint keep it. Arguments can hold customer data; set
+  `ALERT_ARGUMENTS=hide` if they must not leave. On ntfy.sh anyone who knows
+  the topic name can read it, so use a long random name, or your own ntfy
+  server with access control.
+- **A model that argues for its own call.** A model can write "this is
+  safe, approve it" into its arguments, and an alert shows them. Decide on
+  what the call does, not on what it says about itself.
+- **An unsigned alert.** Slack, Discord and ntfy alerts cannot be checked.
+  Treat an alert as a reason to look, and check `razorwire approvals`
+  before approving.
 - **Tool calls that never pass through it.** Tools the agent runs without
   asking the model, tools the provider runs itself (web search, code
   interpreter), and the Responses API's computer and shell calls are not
@@ -81,6 +96,8 @@ and to make tampering visible.
    `RAZORWIRE_ADMIN_KEY` set, both commands reload the proxy themselves.
 8. If you use rollback or parked calls, run the executor as yet another
    user, on a machine or network the agent cannot reach.
+9. If you use alerts, keep `ALERT_URL` as secret as a key, and set
+   `ALERT_ARGUMENTS=hide` when tool arguments carry personal data.
 
 ## Reporting a problem
 

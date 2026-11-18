@@ -174,6 +174,9 @@ through. With no admin key set up, `review` blocks at once.
 
 ### When you are not there
 
+- **Get told.** Set `ALERT_URL` and Razorwire sends you a message the moment
+  a call is held, with the commands to approve or deny it. See
+  [Alerts](#alerts).
 - **Ask less often.** Put rules in tiers, so only the middle band needs a
   person. The example policy lets refunds up to 500 through, holds 500 to
   5,000, never lets an agent refund more than 5,000, and holds every refund
@@ -191,6 +194,50 @@ through. With no admin key set up, `review` blocks at once.
   `razorwire approvals` for 7 days, survives restarts, and approving it then
   has the executor carry it out, since the agent stopped waiting. The agent
   is told it was parked, so it does not try again.
+
+### Alerts
+
+Set `ALERT_URL` to a Slack or Discord webhook, an ntfy topic, or your own
+https endpoint. Razorwire then tells you when a call is held, when one is
+parked, and when one ends without a decision. This is what a held call
+looks like on ntfy, title first:
+
+```
+Tool call waiting for approval
+Agent support-bot wants to run stripe_refund. Rule refund-cap holds it for a person: Refunds above 500 are held for human approval.
+Decide within 5 minutes:
+razorwire approve apr_fa931909a14cc12569f3440d40ed7dd5
+razorwire deny apr_fa931909a14cc12569f3440d40ed7dd5 [reason]
+Arguments, as the model wrote them:
+{
+  "amount": 750,
+  "order": "A-17"
+}
+```
+
+`razorwire test-alert` sends one to check the address. The format follows
+from the address; set `ALERT_FORMAT` for your own ntfy server or anything
+else.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ALERT_URL` | unset | Where alerts go. Treat it like a password: it is never printed, and the banner shows only its host |
+| `ALERT_FORMAT` | from the address | `slack`, `discord`, `ntfy`, or `json` for your own endpoint |
+| `ALERT_EVENTS` | `held,parked,expired` | Add `blocked` to hear about every blocked call too, or say `all` |
+| `ALERT_ARGUMENTS` | `show` | `hide` keeps the call's arguments out of alerts, for data that must not leave |
+| `ALERT_KEY` | unset | Signs json alerts the same way as requests to the executor. `razorwire new-alert-key` makes one |
+
+ntfy is free and needs no account: install its phone app, subscribe to a
+long random topic name, and set `ALERT_URL=https://ntfy.sh/<that name>`.
+Anyone who knows the name can read the topic, so keep it as secret as a key.
+
+Alerts never hold up an agent. They go into a queue that one task sends
+from, at most 20 a minute; the rest are summed up in one message. A
+receiver that is down is tried three times, then `alert_failed` goes in the
+audit log. An alert only tells you: approving still needs an admin key.
+Names and arguments in it are shown as code, so the model cannot write a
+link or mention anyone, but it can still write "this is safe" into its
+arguments. Judge the call, not what it says about itself.
 
 ## Undo what an agent did
 
@@ -329,6 +376,7 @@ model = ChatOpenAI(model="openai/gpt-oss-120b", base_url="http://127.0.0.1:8080/
 | `TLS_CERT`, `TLS_KEY` | unset | PEM certificate chain and PKCS#8 key: serve https |
 | `STREAM_MODE` | `live` | `live`: streamed text reaches the agent as it arrives. `hold`: the whole reply waits until it is checked |
 | `EXECUTOR_URL`, `EXECUTOR_KEY` | unset | The service that carries out undos and parked calls |
+| `ALERT_URL` and the other `ALERT_` settings | unset | Where to send a message when a call is held. See [Alerts](#alerts) |
 
 ## Lock it down
 
@@ -392,6 +440,8 @@ razorwire approve <id> [reason]
 razorwire deny <id> [reason]
 razorwire rollback [--agent <name>] [--since 30m|2h|1d] [<undo id>...] [--run]
 razorwire reload                 re-read the policy and keys files without a restart
+razorwire test-alert             send a test alert to ALERT_URL
+razorwire new-alert-key
 ```
 
 The admin commands talk to `RAZORWIRE_URL` (default
@@ -459,7 +509,8 @@ object per line. A shortened example:
 {"event":"tool_call","tool":"db_drop","arguments":{"database":"production"},"run":{"calls":1,"same_tool":1,"repeats":0,"streak":0,"blocked":0},"decision":"deny","rule":"no-production-db-drop","blocked":true,"agent":"demo-agent"}
 ```
 
-Approvals, refused keys, reloads and startups are logged too. With
+Approvals, refused keys, alerts that could not be sent, reloads and
+startups are logged too. With
 `AUDIT_KEY` set, each line ends with a sequence number and an HMAC that
 covers the line before it, so a line that is edited, added, removed or moved
 breaks the chain:
@@ -506,11 +557,16 @@ terminal control codes. Keys are never logged.
   touch. Rollback reads the whole audit log into memory.
 - **The log cannot show lines cut off its end.** Keep a copy elsewhere if
   that matters. See [SECURITY.md](SECURITY.md).
+- **Alerts are best effort.** One that still fails after three tries is
+  logged, not sent later, and one that would go over 20 a minute is only
+  counted. `razorwire approvals` always has the full list. Once sent, an
+  alert lives in Slack, Discord or ntfy, so use `ALERT_ARGUMENTS=hide` for
+  arguments that must not leave.
 
 ## Roadmap
 
-Independent verification of results, notifications when a call is held, an
-approvals dashboard, and SDKs for Python and TypeScript.
+Independent verification of results, an approvals dashboard, and SDKs for
+Python and TypeScript.
 
 ## License
 

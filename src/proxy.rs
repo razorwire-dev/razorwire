@@ -30,7 +30,8 @@ use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-    approvals::{Approvals, HoldError, Outcome},
+    alerts::{Alerts, Kind},
+    approvals::{shown_arguments, Approvals, HoldError, Outcome},
     audit::{now_ms, Audit},
     auth::{self, Keys, Role},
     executor::Executor,
@@ -144,6 +145,8 @@ pub struct AppState {
     pub approvals: Approvals,
     /// Carries out undos and parked calls. `None` if none is set up.
     pub executor: Option<Executor>,
+    /// Tells a person when a call is held, parked or blocked.
+    pub alerts: Option<Arc<Alerts>>,
     /// One rollback runs at a time.
     pub rollback_lock: Mutex<()>,
     /// Tool results already recorded. Agents resend the whole conversation on
@@ -160,6 +163,7 @@ impl AppState {
         config: Config,
         audit: Arc<Audit>,
         executor: Option<Executor>,
+        alerts: Option<Arc<Alerts>>,
     ) -> Result<AppState, String> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -173,9 +177,15 @@ impl AppState {
             client,
             settings,
             config: RwLock::new(Arc::new(config)),
-            approvals: Approvals::new(MAX_PENDING_APPROVALS, audit.clone(), executor.is_some()),
+            approvals: Approvals::new(
+                MAX_PENDING_APPROVALS,
+                audit.clone(),
+                executor.is_some(),
+                alerts.clone(),
+            ),
             audit,
             executor,
+            alerts,
             rollback_lock: Mutex::new(()),
             seen_results: Mutex::new(HashSet::new()),
             next_request_id: AtomicU64::new(1),
@@ -671,6 +681,27 @@ async fn police(job: &Job<'_>, policy: &Policy, response: &mut Value) -> usize {
         event["blocked"] = json!(true);
         event["approval_error"] = json!(why);
         plan.refuse(index, why);
+    }
+
+    if let Some(alerts) = state
+        .alerts
+        .as_ref()
+        .filter(|alerts| alerts.wants(Kind::Blocked))
+    {
+        for event in plan.events.iter().filter(|event| event["blocked"] == true) {
+            let message = match &event["approval_error"] {
+                Value::Null => &event["reason"],
+                error => error,
+            };
+            let details = json!({
+                "agent": job.agent,
+                "tool": event["tool"],
+                "rule": event["rule"],
+                "message": message,
+                "arguments": shown_arguments(&event["arguments"]),
+            });
+            alerts.notify(Kind::Blocked, details);
+        }
     }
 
     for event in std::mem::take(&mut plan.events) {
