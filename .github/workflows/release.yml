@@ -4,7 +4,8 @@
 # v0.2.0) or when started by hand from the Actions tab with an existing tag.
 # Nothing runs on ordinary pushes, so no Actions minutes are used otherwise.
 # A run takes about 15 minutes of runner time; the macOS job counts ten
-# times against a private repository's free minutes.
+# times against a private repository's free minutes. GitHub retires old macOS
+# images (macos-14 went on 2026-11-02); move to a newer label when it does.
 #
 # The release is left as a draft. Check it, then publish it on GitHub; the
 # install scripts only see published releases.
@@ -32,7 +33,7 @@ jobs:
   draft:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
       - name: Check the tag matches Cargo.toml
@@ -57,7 +58,7 @@ jobs:
           - os: ubuntu-latest
             targets: x86_64-unknown-linux-musl
             features: --features vendored-openssl
-          - os: macos-14
+          - os: macos-15
             targets: aarch64-apple-darwin x86_64-apple-darwin
             features: ""
           - os: windows-latest
@@ -68,7 +69,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
       - name: Install the Rust targets
