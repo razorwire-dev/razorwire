@@ -22,7 +22,8 @@ and to make tampering visible.
 | The admin key crosses a network in the clear | The admin commands refuse a plain-http `RAZORWIRE_URL` unless it points at this machine. With `TLS_CERT` and `TLS_KEY`, Razorwire serves https itself (TLS 1.2 or later). A slow TLS handshake is cut off after 10 seconds, and at most 256 run at once. |
 | A bad config silently turns protection off | A policy, keys file, audit key, certificate, executor or alert setting that is missing or invalid stops the proxy from starting. A reload that finds an invalid file changes nothing. |
 | A streamed reply slips a tool call through while it is still arriving | Under enforcement, only events known to carry nothing but text go out as they arrive. From the first event that could carry a tool call, or that is not understood, everything is held until the whole reply is checked. A stream that cannot be read, or that is cut off, ends with an error instead of the rest. |
-| Someone forges a request to the executor | Every request is signed with HMAC-SHA256 over a timestamp and the body, using `EXECUTOR_KEY`. The example executor refuses a bad signature or a timestamp more than 5 minutes off, and never runs the same id twice. `EXECUTOR_URL` must be https unless it is on this machine, and redirects are not followed. |
+| Someone forges a request to the executor | Every request is signed with HMAC-SHA256 over a timestamp and the body, using `EXECUTOR_KEY`. The example executor and the Python SDK's `Executor` refuse a bad signature or a timestamp more than 5 minutes off, and never run the same id twice. `EXECUTOR_URL` must be https unless it is on this machine, and redirects are not followed. |
+| The Python SDK sends a key somewhere it should not | `Admin` sends the admin key only over https, or plain http to this machine, never through an environment proxy over plain http, and never follows a redirect. `openai_client()` refuses plain http to another machine unless told otherwise. Neither prints a key or shows one in an error. |
 | A rollback acts on a doctored log | Rollback and the restore of parked calls read the signed audit log, and refuse it if any line fails its check. The calls and arguments they act on come from the log, not from anything an agent sends. |
 | Two admins carry out the same thing twice | A parked call is taken out while it runs, and one rollback runs at a time. A step that was undone is recorded and skipped next time. |
 | An alert leaks its webhook address | `ALERT_URL` is never printed or logged; the banner and every error show only its scheme and host. It must be https unless it is on this machine, it may not carry a user name or password, and redirects are not followed. |
@@ -65,6 +66,11 @@ and to make tampering visible.
 - **A model that argues for its own call.** A model can write "this is
   safe, approve it" into its arguments, and an alert shows them. Decide on
   what the call does, not on what it says about itself.
+- **Block notes as proof.** The note left in place of a blocked call is text
+  in the model's reply, so a model can write one that looks the same. The
+  Python SDK's `blocked()` reads these notes to help an agent react; it does
+  not prove anything was blocked. The `x-razorwire-blocked` header comes
+  from the proxy alone.
 - **An unsigned alert.** Slack, Discord and ntfy alerts cannot be checked.
   Treat an alert as a reason to look, and check `razorwire approvals`
   before approving.

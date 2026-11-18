@@ -66,6 +66,9 @@ src/alerts.rs                alerts when a call is held: Slack, Discord, ntfy, j
 src/rollback.rs              the rollback plan, worked out from the audit log
 examples/demo_agent.rs       reckless agents: one drops databases, one gets stuck polling
 examples/executor.py         a starting point for an executor, standard library only
+sdk/python/                  the Python SDK (`razorwire` on PyPI, not published yet):
+                             agent helpers, block notes, admin client, executor,
+                             signature checks, and a proxy runner for tests
 policy/policy.schema.json    JSON Schema for policy files
 policy/example.policy.yaml   example policy, also used by the unit tests
 install.sh, install.ps1      one-command install from a GitHub release
@@ -91,8 +94,9 @@ provider's response, and that is where the proxy acts:
    stopped and by which rule.
 4. Calls that are allowed or approved stay in the response. If none are
    left, the `finish_reason` becomes `stop`.
-5. A non-streamed response, or one streamed with `STREAM_MODE=hold`,
-   carries an `x-razorwire-blocked: <count>` header. A live stream cannot,
+5. When calls were removed, a non-streamed response, or one streamed with
+   `STREAM_MODE=hold`, carries an `x-razorwire-blocked: <count>` header.
+   When nothing was removed there is no header. A live stream never has it,
    because its headers go out before the check.
 
 The agent never receives a blocked call, so it has nothing to execute.
@@ -356,6 +360,33 @@ Unicode direction marks are escaped as `\uXXXX` in every line.
   later; over 20 a minute are only counted. Slack, Discord and ntfy alerts
   are unsigned, and once sent they live at the third party.
 
+## The Python SDK
+
+`sdk/python` is the `razorwire` package (`src/razorwire/`): standard library
+only, Python 3.9 or later. `openai` is imported only inside
+`openai_client()` and `async_openai_client()`.
+
+| Module | Does |
+|---|---|
+| `agent.py` | `openai_client()`, `async_openai_client()`, `base_url()`: an OpenAI client pointed at the proxy, with `RAZORWIRE_AGENT_KEY`. Plain http to another machine is refused unless `allow_plain_http` |
+| `notes.py` | `blocked()` reads block notes from a reply, message, list or text; `blocked_count()` reads `x-razorwire-blocked` |
+| `admin.py` | `Admin`: the admin API, with the same rules as `admin::Client`: https unless loopback, no redirects, no proxy for plain http, ids of `[A-Za-z0-9_]` only |
+| `signing.py` | `sign()` and `verify()`: the executor and json alert signature |
+| `executor.py` | `Executor`: checks signature and age, runs a job id once (409 while it runs), remembers ids across restarts with `log=` |
+| `proxy.py` | `Proxy`: runs the binary on a free loopback port in a temporary folder, with an admin key, for tests |
+
+The SDK copies formats from the proxy. When one of these changes, change
+the SDK and its tests with it: the note from `openai::block_note`, the
+outcome wording in `proxy::police` (denied, expired, parked), the admin
+API's answers, and the signature in `executor::signature`.
+
+Tests: `pip install -e "./sdk/python[test]"`, then `pytest` in `sdk/python`.
+The end-to-end tests run the real binary (`RAZORWIRE_BIN`, else
+`target/debug`, else `PATH`; skipped without one) against a fake provider in
+`tests/conftest.py`, with `tests/policy.yaml`. Lint with
+`ruff check --target-version py39 --line-length 120` and
+`mypy --strict src`.
+
 ## Run it
 
 ```
@@ -440,7 +471,7 @@ without keys, so the demo proxy must not have agent keys set up.
 | Keys and log signing | `sha2`, `hmac`, `getrandom` |
 | https | `tokio-native-tls` (schannel on Windows, OpenSSL on Linux, vendored in the release build) |
 | Releases | GitHub Actions on a `v*` tag: musl Linux, macOS (Apple silicon and Intel), Windows |
-| SDKs | Python and TypeScript, thin wrappers over the Rust core |
+| SDKs | Python (`sdk/python`, standard library only); TypeScript later |
 | Control plane | Next.js on Vercel |
 | Storage | Postgres, ClickHouse for traces |
 | Billing | Stripe |
@@ -451,13 +482,14 @@ without keys, so the demo proxy must not have agent keys set up.
 |---|---|
 | 1-2 | Proxy intercepts and logs tool calls. Done. Repo is private until launch |
 | 3-4 | Policy engine: YAML rules that block an action, and the demo. Done. Loop guard, approvals, keys, signed log and reload: done |
-| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held. Done. Python SDK, LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
+| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; the SDK is not on PyPI yet. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
 | 7 | Rollback through an executor: done. Show HN launch |
 | 8 | Hosted control plane and Stripe billing |
 
 Next up, in order: cut the first release (`git tag v0.1.0`, push the tag),
-the Python SDK, verification (stage 3), public-key signatures and export
-for the audit log (stage 4).
+publish the Python SDK to PyPI (this claims the name; ask first),
+verification (stage 3), public-key signatures and export for the audit log
+(stage 4).
 
 ## Releases
 

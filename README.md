@@ -290,7 +290,8 @@ With `--run`, each undo goes to your **executor**: a small web service you
 run that holds the real credentials. Razorwire never touches your systems
 itself; it signs each request with `EXECUTOR_KEY` and the executor checks
 the signature. [examples/executor.py](examples/executor.py) is a starting
-point with no dependencies. Undos run newest first and stop at the first
+point with no dependencies, and the [Python SDK](#the-python-sdk)'s
+`Executor` does the checking for you. Undos run newest first and stop at the first
 failure; running the same command again skips what was already undone.
 
 The calls and their arguments come from the signed audit log, and a log
@@ -377,6 +378,32 @@ model = ChatOpenAI(model="openai/gpt-oss-120b", base_url="http://127.0.0.1:8080/
 | `STREAM_MODE` | `live` | `live`: streamed text reaches the agent as it arrives. `hold`: the whole reply waits until it is checked |
 | `EXECUTOR_URL`, `EXECUTOR_KEY` | unset | The service that carries out undos and parked calls |
 | `ALERT_URL` and the other `ALERT_` settings | unset | Where to send a message when a call is held. See [Alerts](#alerts) |
+
+### The Python SDK
+
+[sdk/python](sdk/python) is a small package with no dependencies for the
+Python side of Razorwire. For now, install it from the repository:
+`pip install ./sdk/python`.
+
+```python
+import razorwire
+
+client = razorwire.openai_client()        # RAZORWIRE_URL and RAZORWIRE_AGENT_KEY
+reply = client.chat.completions.create(model=..., messages=..., tools=...)
+
+for block in razorwire.blocked(reply):    # what was stopped, and why
+    print(block.tool, block.rule, block.outcome)
+```
+
+It also has:
+
+- `Admin`, for held calls, approvals, rollbacks and reloads from code.
+- `Executor`, the service that carries out undos and parked calls, with
+  signatures and retries handled.
+- `verify()`, which checks a signed JSON alert.
+- `Proxy`, which runs Razorwire with your policy inside a test.
+
+See [sdk/python/README.md](sdk/python/README.md).
 
 ## Lock it down
 
@@ -565,8 +592,8 @@ terminal control codes. Keys are never logged.
 
 ## Roadmap
 
-Independent verification of results, an approvals dashboard, and SDKs for
-Python and TypeScript.
+Independent verification of results, an approvals dashboard, and an SDK
+for TypeScript.
 
 ## License
 

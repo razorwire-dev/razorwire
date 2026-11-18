@@ -1,0 +1,27 @@
+# The policy the SDK's end-to-end tests run against.
+version: 1
+mode: enforce
+default: allow
+
+rules:
+  - id: no-production-db-drop
+    match:
+      tool: db_drop
+    when: args.database == "production"
+    action: deny
+    message: Dropping the production database is blocked by policy.
+
+  - id: refund-cap
+    match:
+      tool: stripe_refund
+    when: args.amount > 500
+    action: review
+    message: Refunds above 500 are held for human approval.
+
+undo:
+  - tool: create_ticket
+    when: has(result.id)
+    call:
+      tool: close_ticket
+      args:
+        id: result.id

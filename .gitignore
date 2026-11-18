@@ -4,3 +4,9 @@ executor.jsonl
 .env
 *.keys
 /.claude/launch.json
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/sdk/python/dist/
+/sdk/python/build/
