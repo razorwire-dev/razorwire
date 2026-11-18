@@ -1,0 +1,52 @@
+# Publishes the Python SDK (sdk/python) to PyPI as `razorwire`.
+#
+# Runs only when started by hand from the Actions tab. It uses PyPI's trusted
+# publishing: pypi.org accepts the upload because it comes from this workflow
+# file in this repository, in the `pypi` environment, so no PyPI password or
+# token is stored anywhere. The upload also carries a signed attestation of
+# where it was built.
+#
+# Before a run, raise the version in sdk/python/pyproject.toml and
+# sdk/python/src/razorwire/_version.py. PyPI never takes the same version
+# twice, and a version cannot be replaced once it is up.
+
+name: pypi
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Check the two version numbers agree
+        run: |
+          project=$(sed -n 's/^version = "\(.*\)"/\1/p' sdk/python/pyproject.toml)
+          module=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' sdk/python/src/razorwire/_version.py)
+          if [ -z "$project" ] || [ "$project" != "$module" ]; then
+            echo "pyproject.toml says '$project' but _version.py says '$module'" >&2
+            exit 1
+          fi
+          echo "Publishing razorwire $project"
+      - name: Test
+        # The end-to-end tests need the razorwire binary and skip without it.
+        run: |
+          python -m pip install -e "./sdk/python[test]"
+          cd sdk/python && python -m pytest -q
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build sdk/python --outdir dist
+          python -m twine check --strict dist/*
+      - uses: pypa/gh-action-pypi-publish@release/v1
