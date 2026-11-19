@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "A proxy that sits between an AI agent and its model provider, records every tool call, and blocks the ones a policy forbids."
+repository = "https://github.com/razorwire-dev/razorwire"
+homepage = "https://razorwire.vercel.app"
+readme = "README.md"
+keywords = ["ai-agents", "llm", "proxy", "security", "guardrails"]
+categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
+# What goes into the crates.io package: the code, the example policy and
+# executor, and the documents. The site, the Python SDK and CI stay out.
+include = ["/src", "/examples", "/policy", "/README.md", "/LICENSE", "/SECURITY.md"]
 
 [dependencies]
 axum = "0.8"
