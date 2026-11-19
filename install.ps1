@@ -2,16 +2,16 @@
 #
 #   irm https://raw.githubusercontent.com/razorwire-dev/razorwire/main/install.ps1 | iex
 #
-# While the repository is private, first set $env:GITHUB_TOKEN to a token
-# that can read it (a fine-grained token with "Contents: read" on this
-# repository is enough), and fetch this script with that token too.
+# $env:GITHUB_TOKEN is only needed to install from a private copy of the
+# repository: set it to a token that can read that copy (a fine-grained token
+# with "Contents: read" is enough), and fetch this script with it too.
 #
 # Settings, all optional:
 #   $env:RAZORWIRE_VERSION       a release tag like v0.2.0 (default: the latest)
 #   $env:RAZORWIRE_INSTALL_DIR   where razorwire.exe goes
 #                                (default: %LOCALAPPDATA%\Programs\razorwire)
 #   $env:RAZORWIRE_NO_PATH       set to 1 to leave your PATH alone
-#   $env:GITHUB_TOKEN            needed while the repository is private
+#   $env:GITHUB_TOKEN            only for a private copy of the repository
 #
 # The download is checked against the release's SHA256SUMS before anything
 # is installed.
@@ -63,7 +63,7 @@
                 try {
                     Invoke-WebRequest -UseBasicParsing -Uri "$base/$name" -OutFile $destination
                 } catch {
-                    throw "razorwire install: cannot download $name. While the repository is private, set GITHUB_TOKEN."
+                    throw "razorwire install: cannot download $name. Check your internet connection and RAZORWIRE_VERSION."
                 }
             }
         }

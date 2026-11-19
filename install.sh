@@ -3,14 +3,14 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/razorwire-dev/razorwire/main/install.sh | sh
 #
-# While the repository is private, set GITHUB_TOKEN to a token that can read
-# it (a fine-grained token with "Contents: read" on this repository is
-# enough), and fetch this script with that token too.
+# GITHUB_TOKEN is only needed to install from a private copy of the
+# repository: set it to a token that can read that copy (a fine-grained token
+# with "Contents: read" is enough), and fetch this script with it too.
 #
 # Settings, all optional:
 #   RAZORWIRE_VERSION       a release tag like v0.2.0 (default: the latest)
 #   RAZORWIRE_INSTALL_DIR   where the binary goes (default: ~/.local/bin)
-#   GITHUB_TOKEN            needed while the repository is private
+#   GITHUB_TOKEN            only for a private copy of the repository
 #
 # The download is checked against the release's SHA256SUMS before anything
 # is installed.
@@ -86,7 +86,7 @@ else
   fi
   fetch() {
     curl -fsSL "$base/$1" -o "$2" ||
-      fail "cannot download $1. While the repository is private, set GITHUB_TOKEN"
+      fail "cannot download $1. Check your internet connection and RAZORWIRE_VERSION"
   }
 fi
 
