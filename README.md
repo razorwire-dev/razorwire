@@ -1,6 +1,9 @@
 # Razorwire
 
 An action firewall for AI agents, written in Rust.
+[razorwire.vercel.app](https://razorwire.vercel.app)
+
+![Two terminals. Without Razorwire, an AI agent told to free disk space drops the staging and the production database. With Razorwire, staging is dropped but the call to drop production is blocked by a policy rule.](docs/demo.svg)
 
 Razorwire is a proxy that sits between an AI agent and its model provider.
 Every tool call the model asks for is checked against your rules. A call that

@@ -73,7 +73,9 @@ policy/policy.schema.json    JSON Schema for policy files
 policy/example.policy.yaml   example policy, also used by the unit tests
 install.sh, install.ps1      one-command install from a GitHub release
 site/                        the public landing page: static HTML, CSS and a
-                             little JS, no build step, not deployed yet
+                             little JS, no build step; live at razorwire.vercel.app
+docs/demo.svg                the animated demo at the top of the README, made by
+                             docs/demo_capture.py (a real run) and docs/demo_render.py
 .github/workflows/release.yml  release builds; runs only on a v* tag or by hand
 .github/workflows/pypi.yml   publishes the Python SDK to PyPI; runs only by hand
 ```
@@ -521,6 +523,18 @@ buttons stay hidden). Light and dark follow the system. The terminal
 outputs on it come from real runs, so keep them and every claim true when
 behaviour changes. Links go to the GitHub repository, which is private
 until launch. To preview: `python -m http.server 8110 --directory site`.
+
+The site is live at https://razorwire.vercel.app, the Vercel project
+`razorwire`. `site/vercel.json` adds security headers, including the same
+CSP plus `frame-ancestors 'none'`. Vercel's GitHub app cannot see the
+private repository, so the site is deployed by uploading the files in
+`site/` directly; nothing redeploys it on a push. After an upload, compare
+the live files with the ones on disk.
+
+`docs/demo.svg` is the README's animated demo: the real output of the
+database demo without and with the example policy, slowed to reading
+speed. When the demo's output changes, run `docs/demo_capture.py` (it
+runs the real proxy and agent against Groq) and then `docs/demo_render.py`.
 
 The dashboard (the paid control plane) is separate and not started. The
 plan is for Lovable to design its screens only, in its own private repo,
