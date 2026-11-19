@@ -9,6 +9,10 @@
 #
 # The release is left as a draft. Check it, then publish it on GitHub; the
 # install scripts only see published releases.
+#
+# A pushed tag whose release is already published stops before building, so
+# moving or re-pushing a tag never swaps the files under a published release.
+# A run started by hand still rebuilds it: every archive and SHA256SUMS.
 
 name: release
 
@@ -45,8 +49,12 @@ jobs:
           fi
       - name: Create the draft release
         run: |
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
+          if ! draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
             gh release create "$TAG" --draft --verify-tag --title "Razorwire $TAG" --generate-notes
+          elif [ "$draft" != true ] && [ "$GITHUB_EVENT_NAME" = push ]; then
+            echo "Release $TAG is already published, so a pushed tag does not rebuild it." >&2
+            echo "To replace its files on purpose, start this workflow by hand." >&2
+            exit 1
           fi
 
   build:

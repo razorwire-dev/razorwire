@@ -503,9 +503,16 @@ builds and tests on each platform, uploads `razorwire-<target>.tar.gz` (or
 with OpenSSL vendored (`--features vendored-openssl`). Publishing the draft
 is done by hand. `install.sh` and `install.ps1` download the latest release
 (or `RAZORWIRE_VERSION`), check it against `SHA256SUMS`, and need
-`GITHUB_TOKEN` while the repository is private. v0.1.0 was released on
-2026-11-18. To publish a draft by hand, open it from the releases list:
-`/releases/edit/<tag>` does not open a draft, it starts a new release.
+`GITHUB_TOKEN` only for a private copy of the repository. v0.1.0 was
+released on 2026-11-18. To publish a draft by hand, open it from the
+releases list: `/releases/edit/<tag>` does not open a draft, it starts a new
+release.
+
+A pushed tag runs the workflow file saved in that tag's commit, not the one
+on `main`. Pushing a tag whose release is already published stops before
+building (from v0.2.0 on; v0.1.0's own copy predates this check). Only a run
+started by hand rebuilds a published release, and it replaces every archive
+and `SHA256SUMS` together.
 
 `.github/workflows/pypi.yml` publishes `sdk/python` to PyPI when started by
 hand. It checks that `pyproject.toml` and `_version.py` agree, runs the unit
