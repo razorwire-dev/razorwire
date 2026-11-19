@@ -316,11 +316,17 @@ irm https://raw.githubusercontent.com/razorwire-dev/razorwire/main/install.ps1 |
 ```
 
 The scripts download the build for your machine from the latest release and
-check it against the release's `SHA256SUMS` before installing it. While the
-repository is private, set `GITHUB_TOKEN` to a token that can read it first.
-Release builds exist for Linux x86_64 (static, any distribution), macOS on
-Apple silicon and Intel, and Windows x86_64. Anywhere else, or to build it
-yourself: `cargo install --path .`
+check it against the release's `SHA256SUMS` before installing it. Release
+builds exist for Linux x86_64 (static, any distribution), macOS on Apple
+silicon and Intel, and Windows x86_64.
+
+With a Rust toolchain, build it from crates.io instead:
+
+```
+cargo install razorwire
+```
+
+Or, from a copy of this repository: `cargo install --path .`
 
 ## Run it
 

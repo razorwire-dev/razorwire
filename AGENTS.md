@@ -3,9 +3,10 @@
 Context for coding agents (Antigravity, Claude Code) working in this repo.
 
 The project is named **Razorwire** (chosen 2026-11-16). The code lives in the
-private GitHub repo `razorwire-dev/razorwire`; keep it private until launch.
-The name is taken on PyPI (the Python SDK, 2026-11-18) but not yet on
-crates.io or npm. The folder on disk is still called `agent-firewall`.
+GitHub repo `razorwire-dev/razorwire`, public since 2026-11-19. The name is
+taken on PyPI (the Python SDK, 2026-11-18) and crates.io (the proxy,
+2026-11-19), not yet on npm. The folder on disk is still called
+`agent-firewall`.
 
 ## What this is
 
@@ -483,16 +484,16 @@ without keys, so the demo proxy must not have agent keys set up.
 
 | Weeks | Ship |
 |---|---|
-| 1-2 | Proxy intercepts and logs tool calls. Done. Repo is private until launch |
+| 1-2 | Proxy intercepts and logs tool calls. Done. Repo public since 2026-11-19 |
 | 3-4 | Policy engine: YAML rules that block an action, and the demo. Done. Loop guard, approvals, keys, signed log and reload: done |
-| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; v0.1.0 released and the SDK is on PyPI. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
+| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; v0.1.0 released, the SDK is on PyPI and the proxy on crates.io. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
 | 7 | Rollback through an executor: done. Show HN launch |
 | 8 | Hosted control plane and Stripe billing |
 
-Next up, in order: get ready to launch (put the site online, a demo clip,
-make the repository public, try the install scripts against the real
-release), launch, then verification (stage 3), public-key signatures and
-export for the audit log (stage 4).
+Next up, in order: launch (Show HN, then Product Hunt on another day; the
+site, demo clip, public repository and install scripts are done and
+checked), then verification (stage 3), public-key signatures and export
+for the audit log (stage 4).
 
 ## Releases
 
@@ -507,6 +508,14 @@ is done by hand. `install.sh` and `install.ps1` download the latest release
 released on 2026-11-18. To publish a draft by hand, open it from the
 releases list: `/releases/edit/<tag>` does not open a draft, it starts a new
 release.
+
+The proxy is also on crates.io (`cargo install razorwire`). v0.1.0 was
+published by hand with `cargo publish` and a 7-day token limited to the
+`razorwire` crate, then `cargo logout`. `include` in `Cargo.toml` limits
+the package to `src`, `examples`, `policy` and the documents; check
+`cargo package --list` before a publish. A version published there can be
+yanked but never removed. For later versions, crates.io's trusted
+publishing from GitHub Actions avoids tokens.
 
 A pushed tag runs the workflow file saved in that tag's commit, not the one
 on `main`. Pushing a tag whose release is already published stops before
@@ -528,8 +537,8 @@ Content-Security-Policy meta tag allows only the site's own files and Google
 Fonts. The page works without JavaScript (tabs show every panel, copy
 buttons stay hidden). Light and dark follow the system. The terminal
 outputs on it come from real runs, so keep them and every claim true when
-behaviour changes. Links go to the GitHub repository, which is private
-until launch. To preview: `python -m http.server 8110 --directory site`.
+behaviour changes. Links go to the public GitHub repository. To preview:
+`python -m http.server 8110 --directory site`.
 
 The site is live at https://razorwire.vercel.app, the Vercel project
 `razorwire`. `site/vercel.json` adds security headers, including the same
