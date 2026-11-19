@@ -107,5 +107,6 @@ and to make tampering visible.
 
 ## Reporting a problem
 
-Report security problems privately to the maintainer. Do not open a public
-issue.
+Report security problems privately: on the repository's **Security** tab,
+choose **Report a vulnerability**. Only the maintainer sees the report. Do
+not open a public issue for a security problem.
