@@ -1,6 +1,6 @@
 [package]
 name = "razorwire"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "A proxy that sits between an AI agent and its model provider, records every tool call, and blocks the ones a policy forbids."

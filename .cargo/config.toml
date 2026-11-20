@@ -1,0 +1,6 @@
+# Link the C runtime into the Windows build, so razorwire.exe runs on a PC
+# without the Visual C++ redistributable (vcruntime140.dll). Other targets
+# are not affected: the Linux release is already static, and macOS only uses
+# system libraries.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

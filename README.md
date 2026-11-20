@@ -318,7 +318,8 @@ irm https://raw.githubusercontent.com/razorwire-dev/razorwire/main/install.ps1 |
 The scripts download the build for your machine from the latest release and
 check it against the release's `SHA256SUMS` before installing it. Release
 builds exist for Linux x86_64 (static, any distribution), macOS on Apple
-silicon and Intel, and Windows x86_64.
+silicon and Intel, and Windows x86_64. Each is a single program with
+nothing else to install.
 
 With a Rust toolchain, build it from crates.io instead:
 
@@ -327,6 +328,12 @@ cargo install razorwire
 ```
 
 Or, from a copy of this repository: `cargo install --path .`
+
+On Linux, building needs OpenSSL's development files first:
+`sudo apt install pkg-config libssl-dev` on Debian and Ubuntu,
+`sudo dnf install openssl-devel` on Fedora. To build OpenSSL in instead,
+add `--features vendored-openssl` (that needs a C compiler, `make` and
+Perl). macOS and Windows need nothing extra.
 
 ## Run it
 

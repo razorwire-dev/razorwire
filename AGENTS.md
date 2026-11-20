@@ -49,6 +49,7 @@ Open-source core (MIT), paid hosted control plane later.
 README.md                    public front page: what it is, demo, how to run
 SECURITY.md                  what is protected, how, and what is not
 Cargo.toml                   crate manifest
+.cargo/config.toml           Windows MSVC builds link the C runtime in
 src/main.rs                  the command line: serve, new-key, verify-log, approve...
 src/proxy.rs                 the proxy: auth, forwarding, policing, waiting on approvals,
                              live streaming with heartbeats
@@ -486,7 +487,7 @@ without keys, so the demo proxy must not have agent keys set up.
 |---|---|
 | 1-2 | Proxy intercepts and logs tool calls. Done. Repo public since 2026-11-19 |
 | 3-4 | Policy engine: YAML rules that block an action, and the demo. Done. Loop guard, approvals, keys, signed log and reload: done |
-| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; v0.1.0 released, the SDK is on PyPI and the proxy on crates.io. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
+| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; v0.1.0 released (v0.1.1 fixes the Windows build), the SDK is on PyPI and the proxy on crates.io. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
 | 7 | Rollback through an executor: done. Show HN launch |
 | 8 | Hosted control plane and Stripe billing |
 
@@ -509,7 +510,14 @@ released on 2026-11-18. To publish a draft by hand, open it from the
 releases list: `/releases/edit/<tag>` does not open a draft, it starts a new
 release.
 
-The proxy is also on crates.io (`cargo install razorwire`). v0.1.0 was
+v0.1.1 (2026-11-20) only changes the Windows build: `.cargo/config.toml`
+links the C runtime in (`+crt-static`), because v0.1.0's `razorwire.exe`
+needed `vcruntime140.dll`, which a fresh Windows install may lack. After a
+Windows release, check the archive's binary no longer names that DLL.
+
+The proxy is also on crates.io (`cargo install razorwire`). It still has
+0.1.0, the same code as 0.1.1; publishing 0.1.1 there would only refresh
+the README shown on crates.io. v0.1.0 was
 published by hand with `cargo publish` and a 7-day token limited to the
 `razorwire` crate, then `cargo logout`. `include` in `Cargo.toml` limits
 the package to `src`, `examples`, `policy` and the documents; check
@@ -519,7 +527,7 @@ publishing from GitHub Actions avoids tokens.
 
 A pushed tag runs the workflow file saved in that tag's commit, not the one
 on `main`. Pushing a tag whose release is already published stops before
-building (from v0.2.0 on; v0.1.0's own copy predates this check). Only a run
+building (from v0.1.1 on; v0.1.0's own copy predates this check). Only a run
 started by hand rebuilds a published release, and it replaces every archive
 and `SHA256SUMS` together.
 
