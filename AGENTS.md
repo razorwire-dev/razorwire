@@ -543,11 +543,10 @@ middleman could hide a tool call from the check. Lines now end where
 clients end them, and under enforcement the agent only gets what was
 checked, written out again (see Streamed replies).
 
-The proxy is also on crates.io (`cargo install razorwire`). It still has
-0.1.0, which has the stream gap that 0.1.2 fixes, so 0.1.2 should be
-published there too. v0.1.0 was
-published by hand with `cargo publish` and a 7-day token limited to the
-`razorwire` crate, then `cargo logout`. `include` in `Cargo.toml` limits
+The proxy is also on crates.io (`cargo install razorwire`): 0.1.0 and,
+since 2026-11-25, 0.1.2 (0.1.1 was skipped there, as it only changed the
+Windows build). Both were published by hand with `cargo publish` and a
+7-day token limited to the `razorwire` crate, then `cargo logout`. `include` in `Cargo.toml` limits
 the package to `src`, `examples`, `policy` and the documents; check
 `cargo package --list` before a publish. A version published there can be
 yanked but never removed. For later versions, crates.io's trusted
