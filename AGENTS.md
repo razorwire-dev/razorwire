@@ -509,7 +509,7 @@ without keys, so the demo proxy must not have agent keys set up.
 |---|---|
 | 1-2 | Proxy intercepts and logs tool calls. Done. Repo public since 2026-11-19 |
 | 3-4 | Policy engine: YAML rules that block an action, and the demo. Done. Loop guard, approvals, keys, signed log and reload: done |
-| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; v0.1.0 released (v0.1.1 fixes the Windows build), the SDK is on PyPI and the proxy on crates.io. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
+| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; v0.1.0 released (v0.1.1 fixes the Windows build, v0.1.2 a stream gap), the SDK is on PyPI and the proxy on crates.io. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
 | 7 | Rollback through an executor: done. Show HN launch |
 | 8 | Hosted control plane and Stripe billing |
 
@@ -537,9 +537,15 @@ links the C runtime in (`+crt-static`), because v0.1.0's `razorwire.exe`
 needed `vcruntime140.dll`, which a fresh Windows install may lack. After a
 Windows release, check the archive's binary no longer names that DLL.
 
+v0.1.2 (2026-11-25) is a security fix. Streams were split into lines at LF
+only, while clients also end a line at a lone CR, so a provider or a
+middleman could hide a tool call from the check. Lines now end where
+clients end them, and under enforcement the agent only gets what was
+checked, written out again (see Streamed replies).
+
 The proxy is also on crates.io (`cargo install razorwire`). It still has
-0.1.0, the same code as 0.1.1; publishing 0.1.1 there would only refresh
-the README shown on crates.io. v0.1.0 was
+0.1.0, which has the stream gap that 0.1.2 fixes, so 0.1.2 should be
+published there too. v0.1.0 was
 published by hand with `cargo publish` and a 7-day token limited to the
 `razorwire` crate, then `cargo logout`. `include` in `Cargo.toml` limits
 the package to `src`, `examples`, `policy` and the documents; check
