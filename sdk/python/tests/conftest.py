@@ -41,6 +41,10 @@ class FakeProvider:
     `CALL <tool> <json arguments>` becomes a tool call, and other lines are
     said back as text. When the last message is a tool result, the model
     just says "Done."
+
+    In a streamed chat reply, `SMUGGLE <tool> <json arguments>` sends the
+    call the way a hostile provider might: behind a comment, separated by a
+    lone CR, which clients read as a line break.
     """
 
     def __init__(self):
@@ -57,7 +61,7 @@ class FakeProvider:
                 provider.requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
                 if self.path.endswith("/chat/completions"):
                     if body.get("stream"):
-                        return self.stream(provider.chat_chunks(body))
+                        return self.stream(provider.chat_chunks(body), provider.smuggled_chunks(body))
                     return self.answer(provider.chat(body))
                 if self.path.endswith("/responses"):
                     return self.answer(provider.responses(body))
@@ -71,9 +75,11 @@ class FakeProvider:
                 self.end_headers()
                 self.wfile.write(data)
 
-            def stream(self, chunks):
-                data = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
-                data = data.encode()
+            def stream(self, chunks, smuggled=()):
+                events = [f"data: {json.dumps(chunk)}\n\n" for chunk in chunks]
+                # Hidden calls go after the first chunk, before the finish.
+                events[1:1] = [f": nothing here\rdata: {json.dumps(chunk)}\n\n" for chunk in smuggled]
+                data = ("".join(events) + "data: [DONE]\n\n").encode()
                 self.send_response(200)
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("content-length", str(len(data)))
@@ -97,9 +103,32 @@ class FakeProvider:
             if line.startswith("CALL "):
                 _, tool, arguments = line.split(" ", 2)
                 calls.append((tool, arguments))
-            elif line.strip():
+            elif line.strip() and not line.startswith("SMUGGLE "):
                 said.append(line.strip())
         return " ".join(said), calls
+
+    def smuggled_chunks(self, body):
+        text = self.last_user_text(body.get("messages") or []) or ""
+        chunks = []
+        for line in text.splitlines():
+            if line.startswith("SMUGGLE "):
+                _, tool, arguments = line.split(" ", 2)
+                call = {
+                    "index": len(chunks),
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {"name": tool, "arguments": arguments},
+                }
+                chunks.append(
+                    {
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": body.get("model"),
+                        "choices": [{"index": 0, "delta": {"tool_calls": [call]}, "finish_reason": None}],
+                    }
+                )
+        return chunks
 
     @staticmethod
     def last_user_text(items):

@@ -3,13 +3,17 @@
 //! A streamed reply arrives as many small events, and a tool call is spread
 //! across them: the name in one, the arguments in pieces over several more.
 //! `StreamCapture` reassembles the events into the same shape a non-streamed
-//! reply has, so the same policy check applies. `chat_stream` and
-//! `responses_stream` turn a rewritten reply back into a stream.
+//! reply has, so the same policy check applies.
 //!
 //! `LiveGate` lets the start of a reply through as it arrives, as long as it
 //! is only text, and holds everything back from the first event that could
 //! carry a tool call. `chat_tail` and `responses_tail` rebuild the held part
-//! to fit after what the agent already received.
+//! from the checked reply, to fit after what the agent already received.
+//!
+//! The agent never gets the provider's own bytes under an enforced policy.
+//! Each event is read the way clients read it, checked, and written out
+//! again from what was read, so no client can find in it something the
+//! check did not see.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,54 +21,184 @@ use serde_json::{json, Map, Value};
 
 use crate::openai::array;
 
-/// Splits a byte stream into the `data` payloads of its events.
+/// Splits bytes into lines the way the server-sent events spec does: a line
+/// ends at CRLF, at LF, or at a lone CR. Clients split the same way (the
+/// OpenAI SDKs do), so a lone CR cannot hide a line from the check.
+#[derive(Default)]
+struct Lines {
+    /// Bytes after the last complete line.
+    pending: Vec<u8>,
+    /// The last line ended with CR, so an LF right after it belongs to it.
+    after_cr: bool,
+}
+
+impl Lines {
+    fn feed(&mut self, bytes: &[u8], lines: &mut Vec<Vec<u8>>) {
+        let mut start = 0;
+        for (index, &byte) in bytes.iter().enumerate() {
+            if byte != b'\n' && byte != b'\r' {
+                continue;
+            }
+            if byte == b'\n' && self.after_cr && index == start && self.pending.is_empty() {
+                // The LF of a CRLF, perhaps in the next piece of the stream.
+                self.after_cr = false;
+                start = index + 1;
+                continue;
+            }
+            self.pending.extend_from_slice(&bytes[start..index]);
+            lines.push(std::mem::take(&mut self.pending));
+            self.after_cr = byte == b'\r';
+            start = index + 1;
+        }
+        if start < bytes.len() {
+            self.after_cr = false;
+            self.pending.extend_from_slice(&bytes[start..]);
+        }
+    }
+
+    /// The last line, when the stream ends without a line break.
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        self.after_cr = false;
+        (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
+    }
+}
+
+/// One event, as a client reads it.
+#[derive(Debug, PartialEq)]
+struct SseEvent {
+    /// The `event:` field.
+    name: Option<String>,
+    /// The `data:` lines, joined with LF. `None` for an event without data,
+    /// such as a comment that keeps the connection open.
+    data: Option<String>,
+}
+
+/// Reads the events of a stream, following the spec's rules for lines and
+/// fields, as clients do.
 #[derive(Default)]
 struct EventReader {
-    /// Bytes received after the last complete line.
-    pending: Vec<u8>,
+    lines: Lines,
+    /// `event:` of the event being read.
+    name: Option<String>,
     /// `data:` lines of the event being read.
     data: Vec<String>,
+    /// A line of the event being read has arrived.
+    started: bool,
 }
 
 impl EventReader {
-    fn feed(&mut self, bytes: &[u8], payloads: &mut Vec<String>) {
-        self.pending.extend_from_slice(bytes);
-        let mut start = 0;
-        while let Some(offset) = self.pending[start..].iter().position(|&b| b == b'\n') {
-            let line = self.pending[start..start + offset].to_vec();
-            start += offset + 1;
-            self.line(&line, payloads);
+    fn feed(&mut self, bytes: &[u8], events: &mut Vec<SseEvent>) {
+        let mut lines = Vec::new();
+        self.lines.feed(bytes, &mut lines);
+        for line in lines {
+            self.line(&line, events);
         }
-        self.pending.drain(..start);
     }
 
-    fn line(&mut self, line: &[u8], payloads: &mut Vec<String>) {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+    fn line(&mut self, line: &[u8], events: &mut Vec<SseEvent>) {
         if line.is_empty() {
             // A blank line ends the event.
-            self.dispatch(payloads);
-        } else if let Some(rest) = line.strip_prefix(b"data:") {
-            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
-            self.data.push(String::from_utf8_lossy(rest).into_owned());
+            self.dispatch(events);
+            return;
         }
-        // `event:`, `id:`, `retry:` and comment lines carry nothing needed here.
+        self.started = true;
+        if line.starts_with(b":") {
+            return; // a comment
+        }
+        // `field: value`, or a line without a colon, which is a field with
+        // an empty value.
+        let (field, value) = match line.iter().position(|&byte| byte == b':') {
+            Some(colon) => {
+                let value = &line[colon + 1..];
+                (&line[..colon], value.strip_prefix(b" ").unwrap_or(value))
+            }
+            None => (line, &[][..]),
+        };
+        match field {
+            b"data" => self.data.push(String::from_utf8_lossy(value).into_owned()),
+            b"event" => self.name = Some(String::from_utf8_lossy(value).into_owned()),
+            // `id`, `retry` and unknown fields carry nothing used here, and
+            // are never passed on.
+            _ => {}
+        }
     }
 
-    fn dispatch(&mut self, payloads: &mut Vec<String>) {
-        if !self.data.is_empty() {
-            payloads.push(self.data.join("\n"));
-            self.data.clear();
+    fn dispatch(&mut self, events: &mut Vec<SseEvent>) {
+        let name = self.name.take();
+        if !std::mem::take(&mut self.started) {
+            return;
         }
+        let data = (!self.data.is_empty()).then(|| self.data.join("\n"));
+        self.data.clear();
+        events.push(SseEvent { name, data });
     }
 
-    /// Flush whatever is left when the stream ends without a final blank line.
-    fn finish(&mut self, payloads: &mut Vec<String>) {
-        if !self.pending.is_empty() {
-            let line = std::mem::take(&mut self.pending);
-            self.line(&line, payloads);
+    /// Read whatever is left when the stream ends without a final blank
+    /// line. The check sees such an event, so it is read like any other.
+    fn finish(&mut self, events: &mut Vec<SseEvent>) {
+        if let Some(line) = self.lines.finish() {
+            self.line(&line, events);
         }
-        self.dispatch(payloads);
+        self.dispatch(events);
     }
+}
+
+/// The data of one event, read once for every check.
+#[derive(Debug)]
+enum Payload {
+    /// `[DONE]`, the end of a Chat Completions stream.
+    Done,
+    /// Only whitespace.
+    Blank,
+    Json(Value),
+    /// Not JSON. A stream with one cannot be checked.
+    Invalid,
+}
+
+impl Payload {
+    fn read(data: &str) -> Payload {
+        let data = data.trim();
+        if data.is_empty() {
+            Payload::Blank
+        } else if data == "[DONE]" {
+            Payload::Done
+        } else {
+            serde_json::from_str(data).map_or(Payload::Invalid, Payload::Json)
+        }
+    }
+}
+
+/// Write one event for the agent, rebuilt from what was read: compact JSON
+/// on a single `data:` line, so every client reads exactly what was checked.
+fn render(name: Option<&str>, payload: Option<&Payload>, out: &mut Vec<u8>) {
+    match payload {
+        // A comment, or an event without data: it becomes a bare comment,
+        // which keeps an idle connection open and carries nothing.
+        None => out.extend_from_slice(b":\n\n"),
+        Some(Payload::Done) => out.extend_from_slice(b"data: [DONE]\n\n"),
+        Some(Payload::Json(value)) => {
+            let mut text = String::new();
+            event(&mut text, event_name(name, value), value);
+            out.extend_from_slice(text.as_bytes());
+        }
+        // Nothing to send. A stream with data that is not JSON is refused.
+        Some(Payload::Blank | Payload::Invalid) => {}
+    }
+}
+
+/// The `event:` name sent with an event. A Responses API event is named by
+/// its `type`, which is what was checked, and a Chat Completions chunk has
+/// no name. Anything else keeps the provider's name. Only plain names are
+/// sent, so a name can never add a line or a field.
+fn event_name<'a>(name: Option<&'a str>, value: &'a Value) -> Option<&'a str> {
+    let chosen = match value.get("type").and_then(Value::as_str) {
+        Some(kind) if kind.starts_with("response.") => Some(kind),
+        _ if value.get("choices").is_some() => None,
+        _ => name,
+    };
+    chosen.filter(|name| {
+        !name.is_empty() && name.len() <= 256 && name.bytes().all(|byte| byte.is_ascii_graphic())
+    })
 }
 
 /// What a finished stream turned out to contain.
@@ -77,6 +211,9 @@ pub enum Captured {
     /// It looks like a provider stream but cannot be checked. The reason is
     /// for the log.
     Unreadable(&'static str),
+    /// A Chat Completions stream that the provider ended with an error
+    /// event. The agent gets the error and none of the reply's tool calls.
+    ProviderError(Value),
     /// Nothing in it could carry a tool call.
     Nothing,
 }
@@ -89,25 +226,29 @@ pub struct StreamCapture {
     saw_chat: bool,
     saw_responses: bool,
     terminal: Option<(String, Value)>,
+    /// The first error event of a stream that is not a Responses stream.
+    error: Option<Value>,
     malformed: bool,
 }
 
 impl StreamCapture {
     pub fn feed(&mut self, bytes: &[u8]) {
-        let mut payloads = Vec::new();
-        self.reader.feed(bytes, &mut payloads);
-        for payload in payloads {
-            self.payload(&payload);
-        }
+        let mut events = Vec::new();
+        self.reader.feed(bytes, &mut events);
+        self.read(&events);
     }
 
     pub fn finish(mut self) -> Captured {
-        let mut payloads = Vec::new();
-        self.reader.finish(&mut payloads);
-        for payload in payloads {
-            self.payload(&payload);
-        }
+        let mut events = Vec::new();
+        self.reader.finish(&mut events);
+        self.read(&events);
         self.result()
+    }
+
+    fn read(&mut self, events: &[SseEvent]) {
+        for data in events.iter().filter_map(|event| event.data.as_deref()) {
+            self.payload(&Payload::read(data));
+        }
     }
 
     fn result(self) -> Captured {
@@ -120,20 +261,23 @@ impl StreamCapture {
                 None => Captured::Unreadable("the stream ended without its final response event"),
             };
         }
+        if let Some(error) = self.error {
+            return Captured::ProviderError(error);
+        }
         if self.saw_chat {
             return Captured::Chat(self.chat.into_completion());
         }
         Captured::Nothing
     }
 
-    fn payload(&mut self, payload: &str) {
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            return;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(payload) else {
-            self.malformed = true;
-            return;
+    fn payload(&mut self, payload: &Payload) {
+        let event = match payload {
+            Payload::Done | Payload::Blank => return,
+            Payload::Invalid => {
+                self.malformed = true;
+                return;
+            }
+            Payload::Json(event) => event,
         };
 
         let kind = event["type"].as_str().unwrap_or("");
@@ -148,12 +292,15 @@ impl StreamCapture {
                 self.terminal = Some((kind.to_string(), event["response"].clone()));
             }
         } else if event["object"] == "chat.completion.chunk"
-            || array(&event, "choices")
+            || array(event, "choices")
                 .iter()
                 .any(|choice| choice.get("delta").is_some())
         {
             self.saw_chat = true;
-            self.chat.add(&event);
+            self.chat.add(event);
+        } else if event.get("error").is_some_and(|error| !error.is_null()) && self.error.is_none() {
+            // How Chat Completions providers report a failure mid-stream.
+            self.error = Some(event.clone());
         }
     }
 }
@@ -209,14 +356,14 @@ impl Sent {
     /// Whether this event can go to the agent before the reply is checked,
     /// noting what it carries if so. Only text and status pass. A tool call,
     /// a finish, anything unknown or anything unreadable does not.
-    fn admit(&mut self, payload: &str) -> bool {
-        let Ok(event) = serde_json::from_str::<Value>(payload.trim()) else {
+    fn admit(&mut self, payload: &Payload) -> bool {
+        let Payload::Json(event) = payload else {
             return false; // `[DONE]` too: it ends the stream, so it waits
         };
         match event.get("type") {
-            None => self.admit_chat(&event),
+            None => self.admit_chat(event),
             Some(kind) => match kind.as_str() {
-                Some(kind) if kind.starts_with("response.") => self.admit_response(kind, &event),
+                Some(kind) if kind.starts_with("response.") => self.admit_response(kind, event),
                 _ => false,
             },
         }
@@ -305,17 +452,17 @@ impl Sent {
 /// Splits a provider stream as it arrives: events that only carry text go
 /// to the agent at once, and from the first event that could carry a tool
 /// call on, everything is held until the reply is complete and checked.
-/// Events keep their original bytes.
+/// Every event that goes out is rebuilt from what was read, never the
+/// provider's own bytes.
 #[derive(Default)]
 pub struct LiveGate {
+    reader: EventReader,
     capture: StreamCapture,
-    /// Bytes after the last complete line.
-    pending: Vec<u8>,
-    /// The raw bytes of the event being read, and its `data:` lines.
-    event: Vec<u8>,
-    data: Vec<String>,
     /// Set at the first event that cannot go out live. Never unset.
     holding: bool,
+    /// The held events, rebuilt. Sent only when the stream turns out to
+    /// hold nothing a policy judges; otherwise the held part is rebuilt
+    /// from the checked reply instead.
     held: Vec<u8>,
     sent: Sent,
 }
@@ -323,16 +470,12 @@ pub struct LiveGate {
 impl LiveGate {
     /// Read bytes from the provider. Returns the bytes the agent may have now.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut events = Vec::new();
+        self.reader.feed(bytes, &mut events);
         let mut out = Vec::new();
-        self.pending.extend_from_slice(bytes);
-        let mut start = 0;
-        while let Some(offset) = self.pending[start..].iter().position(|&b| b == b'\n') {
-            let end = start + offset + 1;
-            let line = self.pending[start..end].to_vec();
-            start = end;
-            self.line(&line, &mut out);
+        for event in &events {
+            self.event(event, &mut out);
         }
-        self.pending.drain(..start);
         out
     }
 
@@ -341,53 +484,40 @@ impl LiveGate {
         self.capture.saw_responses
     }
 
-    fn line(&mut self, raw: &[u8], out: &mut Vec<u8>) {
-        self.event.extend_from_slice(raw);
-        let text = raw.strip_suffix(b"\n").unwrap_or(raw);
-        let text = text.strip_suffix(b"\r").unwrap_or(text);
-        if text.is_empty() {
-            self.dispatch(out);
-        } else if let Some(rest) = text.strip_prefix(b"data:") {
-            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
-            self.data.push(String::from_utf8_lossy(rest).into_owned());
-        }
-    }
-
-    fn dispatch(&mut self, out: &mut Vec<u8>) {
-        let raw = std::mem::take(&mut self.event);
-        if !self.data.is_empty() {
-            let payload = self.data.join("\n");
-            self.data.clear();
-            self.capture.payload(&payload);
-            if !self.holding && !self.sent.admit(&payload) {
+    fn event(&mut self, event: &SseEvent, out: &mut Vec<u8>) {
+        let payload = event.data.as_deref().map(Payload::read);
+        if let Some(payload) = &payload {
+            self.capture.payload(payload);
+            if !self.holding && !self.sent.admit(payload) {
                 self.holding = true;
             }
         }
-        // Comment lines and empty events carry nothing and go out as they are,
-        // unless the stream is already being held, which keeps the order.
-        if self.holding {
-            self.held.extend_from_slice(&raw);
-        } else {
-            out.extend_from_slice(&raw);
-        }
+        // Events without data carry nothing and go out at once, unless the
+        // stream is already being held, which keeps the order.
+        let target = if self.holding { &mut self.held } else { out };
+        render(event.name.as_deref(), payload.as_ref(), target);
     }
 
-    /// The stream has ended. Returns the reassembled reply, the bytes that
-    /// were held back, and what the agent already received.
+    /// The stream has ended. Returns the reassembled reply, the held events
+    /// (rebuilt), and what the agent already received.
     pub fn finish(mut self) -> (Captured, Vec<u8>, Sent) {
         // An event that ends without its blank line is still read, and held.
         self.holding = true;
-        if !self.pending.is_empty() {
-            let line = std::mem::take(&mut self.pending);
-            let mut ignored = Vec::new();
-            self.line(&line, &mut ignored);
-        }
-        if !self.event.is_empty() || !self.data.is_empty() {
-            let mut ignored = Vec::new();
-            self.dispatch(&mut ignored);
+        let mut events = Vec::new();
+        self.reader.finish(&mut events);
+        let mut ignored = Vec::new();
+        for event in &events {
+            self.event(event, &mut ignored);
         }
         (self.capture.result(), self.held, self.sent)
     }
+}
+
+/// A provider's error event, for the agent. OpenAI SDKs raise it.
+pub fn provider_error(error: &Value) -> String {
+    let mut out = String::new();
+    event(&mut out, None, error);
+    out
 }
 
 #[derive(Default)]
@@ -566,12 +696,6 @@ fn event(out: &mut String, name: Option<&str>, data: &Value) {
     out.push_str("\n\n");
 }
 
-/// Turn a completion back into a Chat Completions stream. Each choice becomes
-/// one chunk with its whole message and one chunk with its finish reason.
-pub fn chat_stream(completion: &Value) -> String {
-    chat_tail(completion, &Sent::default())
-}
-
 /// The rest of a Chat Completions stream, after what `sent` says the agent
 /// already received: per choice, the text not sent yet, the tool calls that
 /// remain, and the finish reason.
@@ -647,12 +771,6 @@ pub fn chat_tail(completion: &Value, sent: &Sent) -> String {
     out
 }
 
-/// Turn a response object back into a Responses API stream: a start event,
-/// each output item whole, then the final event with the full response.
-pub fn responses_stream(final_event: &str, response: &Value) -> String {
-    responses_tail(final_event, response, &Sent::default())
-}
-
 /// The rest of a Responses API stream, after what `sent` says the agent
 /// already received: each output item not finished yet, whole, then the
 /// final event with the full checked response.
@@ -724,6 +842,35 @@ mod tests {
         capture.finish()
     }
 
+    /// A whole Chat Completions stream for a completion: each choice as one
+    /// chunk with its whole message and one with its finish reason.
+    fn chat_stream(completion: &Value) -> String {
+        chat_tail(completion, &Sent::default())
+    }
+
+    /// A whole Responses API stream for a response: a start event, each
+    /// output item whole, then the final event.
+    fn responses_stream(final_event: &str, response: &Value) -> String {
+        responses_tail(final_event, response, &Sent::default())
+    }
+
+    fn read_events(pieces: &[&[u8]]) -> Vec<SseEvent> {
+        let mut reader = EventReader::default();
+        let mut events = Vec::new();
+        for piece in pieces {
+            reader.feed(piece, &mut events);
+        }
+        reader.finish(&mut events);
+        events
+    }
+
+    fn data_event(name: Option<&str>, data: &str) -> SseEvent {
+        SseEvent {
+            name: name.map(str::to_string),
+            data: Some(data.to_string()),
+        }
+    }
+
     /// A stream the way a provider sends it: the tool call's name in one
     /// chunk and its arguments split over the next ones.
     fn drop_stream(databases: &[&str]) -> String {
@@ -776,34 +923,199 @@ mod tests {
 
     #[test]
     fn events_are_read_across_any_split() {
-        let stream = "data: {\"a\":1}\r\n\r\n: comment\nevent: x\ndata: first\ndata: second\n\ndata: [DONE]\n\n";
-        let whole = {
-            let mut reader = EventReader::default();
-            let mut payloads = Vec::new();
-            reader.feed(stream.as_bytes(), &mut payloads);
-            reader.finish(&mut payloads);
-            payloads
-        };
-        assert_eq!(whole, vec!["{\"a\":1}", "first\nsecond", "[DONE]"]);
+        let stream: &[u8] =
+            b"data: {\"a\":1}\r\n\r\n: comment\nevent: x\ndata: first\ndata: second\n\n\
+            data: [DONE]\r\rdata\n\n";
+        let whole = read_events(&[stream]);
+        assert_eq!(
+            whole,
+            vec![
+                data_event(None, "{\"a\":1}"),
+                data_event(Some("x"), "first\nsecond"),
+                data_event(None, "[DONE]"),
+                // A line with no colon is a field with an empty value.
+                data_event(None, ""),
+            ]
+        );
 
-        // Feeding one byte at a time must give the same events.
-        let mut reader = EventReader::default();
-        let mut payloads = Vec::new();
-        for byte in stream.as_bytes() {
-            reader.feed(&[*byte], &mut payloads);
-        }
-        reader.finish(&mut payloads);
-        assert_eq!(payloads, whole);
+        // Feeding one byte at a time must give the same events, including a
+        // CRLF split between two pieces.
+        let bytes: Vec<&[u8]> = stream.chunks(1).collect();
+        assert_eq!(read_events(&bytes), whole);
+    }
+
+    #[test]
+    fn a_lone_cr_ends_a_line_as_it_does_for_clients() {
+        // Read with LF as the only line end, this is one comment. Clients
+        // (the OpenAI SDKs follow the spec) see a comment and then a data
+        // line, so the check must see that data line too.
+        let events = read_events(&[b": hidden\rdata: {\"b\":2}\n\n"]);
+        assert_eq!(events, vec![data_event(None, "{\"b\":2}")]);
+
+        // CR CR is a line end and a blank line: two events.
+        let events = read_events(&[b"data: 1\r\rdata: 2\r\r"]);
+        assert_eq!(events, vec![data_event(None, "1"), data_event(None, "2")]);
+    }
+
+    #[test]
+    fn comments_and_events_without_data_are_kept_as_keep_alives() {
+        let events = read_events(&[b": ping\n\nid: 7\n\n\n\n"]);
+        let keep_alive = SseEvent {
+            name: None,
+            data: None,
+        };
+        // Two events: the comment and the `id`. The extra blank lines carry
+        // nothing and make no event.
+        assert_eq!(
+            events,
+            vec![
+                keep_alive,
+                SseEvent {
+                    name: None,
+                    data: None
+                }
+            ]
+        );
     }
 
     #[test]
     fn an_event_without_a_final_blank_line_is_still_read() {
         let mut reader = EventReader::default();
-        let mut payloads = Vec::new();
-        reader.feed(b"data: tail", &mut payloads);
-        assert!(payloads.is_empty());
-        reader.finish(&mut payloads);
-        assert_eq!(payloads, vec!["tail"]);
+        let mut events = Vec::new();
+        reader.feed(b"data: tail", &mut events);
+        assert!(events.is_empty());
+        reader.finish(&mut events);
+        assert_eq!(events, vec![data_event(None, "tail")]);
+    }
+
+    #[test]
+    fn a_tool_call_behind_a_lone_cr_is_checked() {
+        let policy = Policy::parse(EXAMPLE).expect("example policy should parse");
+        let call = chat_chunk(
+            json!({ "tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": { "name": "db_drop", "arguments": "{\"database\":\"production\"}" },
+            }] }),
+            Value::Null,
+        );
+        let mut stream = String::new();
+        event(
+            &mut stream,
+            None,
+            &chat_chunk(json!({ "content": "Hi." }), Value::Null),
+        );
+        stream.push_str(&format!(": nothing to see\rdata: {call}\n\n"));
+        event(
+            &mut stream,
+            None,
+            &chat_chunk(json!({}), json!("tool_calls")),
+        );
+        stream.push_str("data: [DONE]\n\n");
+
+        for step in [1, 5, 4096] {
+            let (live, captured, _held, sent) = gate(&stream, step);
+            assert!(live.contains("Hi."), "{live}");
+            assert!(
+                !live.contains("db_drop"),
+                "the call went out unchecked: {live}"
+            );
+            let Captured::Chat(mut completion) = captured else {
+                panic!("expected a chat stream");
+            };
+            assert_eq!(
+                completion["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                "db_drop"
+            );
+            let inspection =
+                inspect_response(&mut completion, Some(&policy), "", &History::default());
+            assert_eq!(inspection.blocked, 1);
+            let tail = chat_tail(&completion, &sent);
+            assert!(!tail.contains("db_drop\""), "{tail}");
+        }
+    }
+
+    #[test]
+    fn the_agent_gets_what_was_checked_not_the_providers_bytes() {
+        // A key given twice: serde_json keeps the last one, and a client that
+        // kept the first would see a tool call. The agent gets the event
+        // written out again, with the one value that was checked.
+        let twice = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\",\
+            \"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"db_drop\"}}],\"tool_calls\":null}}]}\n\n";
+        let (live, _, held, _) = gate(twice, 3);
+        assert!(held.is_empty());
+        assert!(!live.contains("db_drop"), "{live}");
+        assert_eq!(
+            only_data(&live),
+            json!({ "choices": [{ "index": 0, "delta": { "content": "hi", "tool_calls": null } }] })
+        );
+
+        // Extra spaces, a CRLF and an `id` go too: one compact `data:` line.
+        let loose = "id: 9\r\ndata:   {\"choices\" : [ {\"index\":0, \"delta\":{\"content\":\"x\"}} ] }\r\n\r\n";
+        let (live, _, _, _) = gate(loose, 2);
+        assert!(!live.contains("id:") && !live.contains('\r'), "{live}");
+        assert_eq!(
+            only_data(&live),
+            json!({ "choices": [{ "index": 0, "delta": { "content": "x" } }] })
+        );
+    }
+
+    /// The value of a stream that is exactly one compact `data:` event.
+    fn only_data(stream: &str) -> Value {
+        let line = stream
+            .strip_prefix("data: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .unwrap_or_else(|| panic!("not one data event: {stream:?}"));
+        assert!(!line.contains('\n'), "{stream:?}");
+        assert!(
+            !line.contains(": ") && !line.contains(", "),
+            "not compact: {line}"
+        );
+        serde_json::from_str(line).unwrap()
+    }
+
+    #[test]
+    fn event_names_come_from_what_was_checked() {
+        // A Responses event is named by its checked `type`, whatever name
+        // the provider gave it.
+        let delta = "event: thread.run.created\ndata: {\"type\":\"response.output_text.delta\",\
+            \"delta\":\"a\",\"output_index\":0}\n\n";
+        let (live, _, _, _) = gate(delta, 4);
+        assert!(
+            live.starts_with("event: response.output_text.delta\ndata: "),
+            "{live}"
+        );
+
+        // A name that is not plain is dropped rather than sent.
+        let value = json!({ "type": "response.created\ndata: {}", "response": {} });
+        let mut out = Vec::new();
+        render(Some("x"), Some(&Payload::Json(value)), &mut out);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with("data: "), "{out}");
+        assert_eq!(out.matches('\n').count(), 2, "{out}");
+
+        // A chat chunk has no name; other events keep a plain one.
+        assert_eq!(event_name(Some("x"), &json!({ "choices": [] })), None);
+        assert_eq!(
+            event_name(Some("error"), &json!({ "type": "error" })),
+            Some("error")
+        );
+        assert_eq!(event_name(Some("bad name"), &json!({})), None);
+    }
+
+    #[test]
+    fn a_provider_error_ends_a_chat_stream_without_its_calls() {
+        let mut stream = drop_stream(&["staging"]);
+        stream = stream.replace(
+            "data: [DONE]\n\n",
+            "data: {\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}\n\n",
+        );
+        let Captured::ProviderError(error) = capture(&stream) else {
+            panic!("expected the provider's error");
+        };
+        assert_eq!(error["error"]["message"], "overloaded");
+        let sent = provider_error(&error);
+        assert!(sent.starts_with("data: {\"error\":"), "{sent}");
+        assert!(!sent.contains("db_drop"));
     }
 
     #[test]
@@ -1034,7 +1346,7 @@ mod tests {
         for step in [1, 7, 4096] {
             let (live, captured, held, sent) = gate(&talk_then_drop(), step);
             assert!(live.contains("Dropping "), "{live}");
-            assert!(live.contains(": keep-alive"), "comments pass through");
+            assert!(live.contains("\n\n:\n\n"), "comments pass as bare comments");
             assert!(
                 !live.contains("db_drop"),
                 "a tool call went out live: {live}"
@@ -1045,8 +1357,12 @@ mod tests {
             assert!(held.contains("call_production") && held.ends_with("data: [DONE]\n\n"));
             assert_eq!(sent.content[&0], "Dropping both now.");
             assert!(sent.role.contains(&0));
-            // Live and held together are exactly the original stream.
-            assert_eq!(format!("{live}{held}"), talk_then_drop());
+            // Live and held together are the original stream, rebuilt: the
+            // test stream is already compact, and the comment is bare.
+            assert_eq!(
+                format!("{live}{held}"),
+                talk_then_drop().replace(": keep-alive\n\n", ":\n\n")
+            );
             let Captured::Chat(completion) = captured else {
                 panic!("expected a chat stream");
             };
@@ -1109,20 +1425,27 @@ mod tests {
         let finished = chat_chunk(json!({ "content": "a" }), json!("stop"));
         let not_json = json!("garbage");
         for first in [unknown_delta, unknown_choice_field, finished, not_json] {
-            let mut stream = String::new();
+            let mut after = String::new();
+            event(
+                &mut after,
+                None,
+                &chat_chunk(json!({ "content": "after" }), Value::Null),
+            );
             let payload = match &first {
                 Value::String(text) => format!("data: {text}\n\n"),
                 other => format!("data: {other}\n\n"),
             };
-            stream.push_str(&payload);
-            event(
-                &mut stream,
-                None,
-                &chat_chunk(json!({ "content": "after" }), Value::Null),
-            );
-            let (live, _, held, _) = gate(&stream, 3);
+            let stream = format!("{payload}{after}");
+            let (live, captured, held, _) = gate(&stream, 3);
             assert!(live.is_empty(), "{first}: {live}");
-            assert_eq!(held, stream);
+            if first.is_string() {
+                // Data that is not JSON is never sent, and the stream cannot
+                // be checked.
+                assert_eq!(held, after);
+                assert!(matches!(captured, Captured::Unreadable(_)));
+            } else {
+                assert_eq!(held, stream);
+            }
         }
 
         // Fields set to null carry nothing and do not stop the stream.
@@ -1143,8 +1466,15 @@ mod tests {
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {not json";
         let (live, captured, held, _) = gate(stream, 9);
         assert!(live.contains("\"hi\""));
-        assert_eq!(held, "data: {not json");
+        assert!(held.is_empty(), "{held}");
         assert!(matches!(captured, Captured::Unreadable(_)));
+
+        // A complete one is read and held like any other.
+        let stream = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}";
+        let (live, captured, held, _) = gate(stream, 9);
+        assert!(live.is_empty());
+        assert!(held.contains("\"stop\""), "{held}");
+        assert!(matches!(captured, Captured::Chat(_)));
     }
 
     #[test]

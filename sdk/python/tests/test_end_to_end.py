@@ -89,6 +89,49 @@ def test_a_live_stream(proxy):
     assert block.tool == "db_drop"
 
 
+def streamed_reply(stream):
+    """The text and tool calls an agent gets from a streamed reply."""
+    text, calls = "", {}
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        text += delta.content or ""
+        for call in delta.tool_calls or []:
+            joined = calls.setdefault(call.index, {"name": "", "arguments": ""})
+            joined["name"] += (call.function and call.function.name) or ""
+            joined["arguments"] += (call.function and call.function.arguments) or ""
+    return text, [(call["name"], json.loads(call["arguments"])) for _, call in sorted(calls.items())]
+
+
+@pytest.mark.parametrize("stream_mode", ["live", "hold"])
+def test_a_call_hidden_behind_a_lone_cr_is_still_checked(binary, provider, stream_mode):
+    # The provider hides both calls behind comments, split off by a lone CR,
+    # which the OpenAI SDK reads as a line break.
+    with Proxy(policy=POLICY, upstream=provider.url, binary=binary, stream_mode=stream_mode) as proxy:
+        client = proxy.openai_client(agent="ops-bot", max_retries=0)
+        stream = ask(
+            client,
+            'On it.\nSMUGGLE db_drop {"database": "production"}\nSMUGGLE db_drop {"database": "staging"}',
+            stream=True,
+        )
+        text, calls = streamed_reply(stream)
+        assert text.startswith("On it.")
+        assert calls == [("db_drop", {"database": "staging"})]
+        [block] = blocked(text)
+        assert block.rule == "no-production-db-drop"
+        events = [e for e in proxy.audit() if e.get("event") == "tool_call"]
+        assert [e["blocked"] for e in events] == [True, False]
+
+
+def test_an_allowed_streamed_call_arrives_whole(proxy):
+    client = proxy.openai_client(agent="ops-bot", max_retries=0)
+    stream = ask(client, 'Sure.\nCALL create_ticket {"title": "Disk full"}', stream=True)
+    text, calls = streamed_reply(stream)
+    assert text == "Sure."
+    assert calls == [("create_ticket", {"title": "Disk full"})]
+
+
 def test_a_held_call_approved(proxy):
     client = proxy.openai_client(agent="support-bot", max_retries=0, timeout=60)
     with ThreadPoolExecutor(1) as pool:

@@ -122,17 +122,37 @@ A streamed reply (`"stream": true`) spreads each tool call over many events.
   events. Each field is checked against an allowlist. From the first event
   that is not on it (a tool call, a finish reason, `[DONE]`, an unknown field,
   anything unreadable) everything is held. When the stream ends, the whole
-  reply is reassembled and checked by the same code as a plain one. If
-  nothing is blocked the held bytes go out unchanged; otherwise
-  `sse::chat_tail` or `sse::responses_tail` rebuild only the rest, carrying on
-  from what was sent (`sse::Sent`). A stream that cannot be checked, is cut
-  off or is too large ends with an in-band error event that the OpenAI SDK
-  raises. While a held call waits for a human, a comment line goes out every
+  reply is reassembled and checked by the same code as a plain one. The held
+  part is then always rebuilt from the checked reply by `sse::chat_tail` or
+  `sse::responses_tail`, carrying on from what was sent (`sse::Sent`), even
+  when nothing was blocked. A stream that cannot be checked, is cut off or is
+  too large ends with an in-band error event that the OpenAI SDK raises.
+  While a held call waits for a human, a comment line goes out every
   5 seconds, so a client that hung up is noticed and its call withdrawn.
-- **Policy enforced, `STREAM_MODE=hold`:** the whole stream is held back and
-  checked, then sent in one burst: the original bytes, or a rebuilt stream.
+- **Policy enforced, `STREAM_MODE=hold`:** the same gate reads the stream,
+  but nothing goes out until the end: then the text part, written out again,
+  and the rebuilt rest in one burst.
 - **No policy, or shadow mode:** the stream passes through live and is read
   on the side, so tool calls and decisions still reach the audit log.
+
+Under enforcement the agent never gets the provider's own bytes, so it
+cannot find something in them that the check did not see:
+
+- Lines end at CRLF, LF or a lone CR, as the SSE standard and the OpenAI
+  SDK read them (`sse::Lines`). A `: comment\rdata: {...}` line is a
+  comment and then a data line, for the check as for the client.
+- Every event, the text passed on live included, is written out again from
+  what was read (`sse::render`): compact JSON on one `data:` line. Comments
+  and events with no data become `:` keep-alives; `id:` and `retry:` are
+  dropped. A Responses API event is named by its checked `type`, a chat
+  chunk has no name, and any other event keeps the provider's name only if
+  it is plain ASCII of up to 256 bytes.
+- An error event in a chat stream (`{"error": ...}`, not a chunk) ends the
+  reply: it is sent on as the error, without the stream's tool calls
+  (`Captured::ProviderError`).
+- A non-streamed response is written out again from the parsed JSON, so a
+  duplicate key comes out once, with the value that was checked.
+  serde_json's `float_roundtrip` feature keeps every number exact.
 
 ### Loop guard
 
@@ -332,10 +352,12 @@ Unicode direction marks are escaped as `\uXXXX` in every line.
 - **Streamed tool calls wait.** Under enforcement, text streams live, but
   from the first tool call the rest is held until the reply is complete (up
   to 32 MB). A live stream has no `x-razorwire-blocked` header.
-- **Rebuilt streams are minimal.** When a call is blocked, the rebuilt part
-  of a Chat Completions stream carries the text and the remaining tool
-  calls; other streamed fields such as reasoning are dropped. The rebuilt
-  part of a Responses API stream has only item and final events. Both parse
+- **Rebuilt streams are minimal.** Under enforcement, everything after the
+  first held event is rebuilt from the checked reply, blocked or not. In a
+  Chat Completions stream that part carries the text, the remaining tool
+  calls, the finish reason and usage; other fields in it, such as reasoning
+  or logprobs, are dropped. In a Responses API stream it has only item and
+  final events. Both parse
   in the OpenAI Python SDK.
 - **Clients tested.** Groq with raw HTTP clients, the OpenAI Python SDK 3.53
   (Chat Completions plain, streamed and the stream helper; the Responses API

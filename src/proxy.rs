@@ -498,14 +498,19 @@ pub async fn forward(
                         inspection.blocked
                     }
                 };
-                if blocked == 0 {
-                    Body::from(bytes)
-                } else {
+                if blocked > 0 {
                     response_headers.insert(
                         HeaderName::from_static("x-razorwire-blocked"),
                         HeaderValue::from(blocked),
                     );
+                }
+                if enforced.is_some() || blocked > 0 {
+                    // The agent gets the reply as it was read and checked,
+                    // not the provider's bytes, which a client could read
+                    // differently (a key given twice, for one).
                     Body::from(response.to_string())
+                } else {
+                    Body::from(bytes)
                 }
             }
             Err(_) => {
@@ -778,8 +783,10 @@ fn sentence(text: &str) -> String {
 }
 
 /// Under an enforced policy: hold the whole stream back, check it, then send
-/// either the original bytes or a rebuilt stream with the blocked calls
-/// removed. Nothing reaches the agent until the check is done.
+/// it in one go. It is read by the same gate as a live stream, so the text
+/// it would have let through goes first, and the rest is rebuilt from the
+/// checked reply, without the blocked calls. Nothing reaches the agent until
+/// the check is done.
 async fn police_stream(
     job: &Job<'_>,
     policy: &Policy,
@@ -787,19 +794,20 @@ async fn police_stream(
     mut upstream: reqwest::Response,
     headers: &mut HeaderMap,
 ) -> Result<Body, Box<Response>> {
-    let mut capture = StreamCapture::default();
-    let mut original: Vec<u8> = Vec::new();
+    let mut gate = sse::LiveGate::default();
+    let mut ready: Vec<u8> = Vec::new();
+    let mut read = 0usize;
     loop {
         match upstream.chunk().await {
             Ok(Some(chunk)) => {
-                if original.len() + chunk.len() > MAX_STREAM_BYTES {
+                read = read.saturating_add(chunk.len());
+                if read > MAX_STREAM_BYTES {
                     let reason = "the streamed response is too large to check";
                     return Err(Box::new(
                         refuse_response(job.state, job.request_id, path, reason).await,
                     ));
                 }
-                capture.feed(&chunk);
-                original.extend_from_slice(&chunk);
+                ready.extend(gate.feed(&chunk));
             }
             Ok(None) => break,
             Err(err) => {
@@ -814,36 +822,37 @@ async fn police_stream(
         }
     }
 
-    let rebuilt = match capture.finish() {
-        Captured::Nothing => None,
+    let (captured, held, sent) = gate.finish();
+    let (blocked, rest) = match captured {
+        Captured::Nothing => (0, held),
         Captured::Unreadable(reason) => {
             return Err(Box::new(
                 refuse_response(job.state, job.request_id, path, reason).await,
             ));
         }
+        Captured::ProviderError(error) => (0, sse::provider_error(&error).into_bytes()),
         Captured::Chat(mut completion) => {
             let blocked = police(job, policy, &mut completion).await;
-            (blocked > 0).then(|| (blocked, sse::chat_stream(&completion)))
+            (blocked, sse::chat_tail(&completion, &sent).into_bytes())
         }
         Captured::Responses {
             event,
             mut response,
         } => {
             let blocked = police(job, policy, &mut response).await;
-            (blocked > 0).then(|| (blocked, sse::responses_stream(&event, &response)))
+            let tail = sse::responses_tail(&event, &response, &sent);
+            (blocked, tail.into_bytes())
         }
     };
 
-    match rebuilt {
-        None => Ok(Body::from(original)),
-        Some((blocked, stream)) => {
-            headers.insert(
-                HeaderName::from_static("x-razorwire-blocked"),
-                HeaderValue::from(blocked),
-            );
-            Ok(Body::from(stream))
-        }
+    if blocked > 0 {
+        headers.insert(
+            HeaderName::from_static("x-razorwire-blocked"),
+            HeaderValue::from(blocked),
+        );
     }
+    ready.extend_from_slice(&rest);
+    Ok(Body::from(ready))
 }
 
 /// A streamed reply being policed live.
@@ -890,25 +899,23 @@ impl Live {
             history: &self.history,
             holds: self.holds,
         };
+        // The held part is rebuilt from the checked reply even when nothing
+        // was blocked, so the agent gets exactly the calls that were judged,
+        // whole, however the provider spread them over its events.
         match captured {
             Captured::Nothing => held,
             Captured::Unreadable(reason) => self.refuse(reason, responses).await,
+            Captured::ProviderError(error) => sse::provider_error(&error).into_bytes(),
             Captured::Chat(mut completion) => {
-                if police(&job, &self.policy, &mut completion).await == 0 {
-                    held
-                } else {
-                    sse::chat_tail(&completion, &sent).into_bytes()
-                }
+                police(&job, &self.policy, &mut completion).await;
+                sse::chat_tail(&completion, &sent).into_bytes()
             }
             Captured::Responses {
                 event,
                 mut response,
             } => {
-                if police(&job, &self.policy, &mut response).await == 0 {
-                    held
-                } else {
-                    sse::responses_tail(&event, &response, &sent).into_bytes()
-                }
+                police(&job, &self.policy, &mut response).await;
+                sse::responses_tail(&event, &response, &sent).into_bytes()
             }
         }
     }
@@ -928,7 +935,8 @@ impl Live {
 /// Under an enforced policy, with live streaming: pass the reply on as it
 /// arrives while it is only text, and hold everything from the first event
 /// that could carry a tool call until the whole reply is checked. Then send
-/// the held part unchanged, or rebuilt without the blocked calls. A tool
+/// the held part rebuilt from the checked reply, without the blocked calls.
+/// Every event is rebuilt from what was read, never forwarded as is. A tool
 /// call never reaches the agent before its decision. If the agent hangs up,
 /// the stream is dropped, and with it any held approval.
 fn police_live(live: Live) -> Body {
@@ -1007,7 +1015,9 @@ fn watch_stream(
                         let mut reply = match capture.finish() {
                             Captured::Chat(completion) => completion,
                             Captured::Responses { response, .. } => response,
-                            Captured::Unreadable(_) | Captured::Nothing => return None,
+                            Captured::Unreadable(_)
+                            | Captured::ProviderError(_)
+                            | Captured::Nothing => return None,
                         };
                         let inspection = openai::inspect_response(
                             &mut reply,

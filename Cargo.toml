@@ -22,7 +22,9 @@ hmac = "0.13.0"
 reqwest = { version = "0.12", features = ["stream"] }
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
-serde_json = "1"
+# float_roundtrip: replies are written out again after the check, and must
+# keep every number exactly as the provider sent it.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.11.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "io-util", "sync", "time"] }
 # Already used by reqwest for https to the provider; this serves https too.

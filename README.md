@@ -569,7 +569,9 @@ terminal control codes. Keys are never logged.
 
 - **Streamed tool calls wait for their check.** Under enforcement, streamed
   text reaches the agent as it arrives, but from the first tool call on, the
-  rest of the reply is held until the whole reply has been checked. A
+  rest of the reply is held until the whole reply has been checked. That
+  rest is rebuilt from the checked reply, so in it only text, tool calls and
+  usage come through; other fields there, such as reasoning, are dropped. A
   streamed reply carries no `x-razorwire-blocked` header, because its headers
   are sent before the check; the note in the reply says what was blocked.
 - **Tested with a few clients so far.** Verified against Groq with raw HTTP
