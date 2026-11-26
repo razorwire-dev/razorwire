@@ -564,12 +564,11 @@ the proxy chose the stream check by the provider's `Content-Type` and
 passed on unreadable bodies not labelled JSON, while the OpenAI SDKs read
 a stream whenever one was asked for, parse any successful reply, and
 follow redirects. Now the request decides, and unreadable, compressed and
-redirected replies are refused (see Streamed replies). crates.io still
-has 0.1.2, without this fix.
+redirected replies are refused (see Streamed replies).
 
-The proxy is also on crates.io (`cargo install razorwire`): 0.1.0 and,
-since 2026-11-25, 0.1.2 (0.1.1 was skipped there, as it only changed the
-Windows build). Both were published by hand with `cargo publish` and a
+The proxy is also on crates.io (`cargo install razorwire`): 0.1.0, 0.1.2
+(2026-11-25) and 0.1.3 (2026-11-26); 0.1.1 was skipped there, as it only
+changed the Windows build. Each was published by hand with `cargo publish` and a
 7-day token limited to the `razorwire` crate, then `cargo logout`. `include` in `Cargo.toml` limits
 the package to `src`, `examples`, `policy` and the documents; check
 `cargo package --list` before a publish. A version published there can be
