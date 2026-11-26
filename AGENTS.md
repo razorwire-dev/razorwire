@@ -525,7 +525,7 @@ without keys, so the demo proxy must not have agent keys set up.
 |---|---|
 | 1-2 | Proxy intercepts and logs tool calls. Done. Repo public since 2026-11-19 |
 | 3-4 | Policy engine: YAML rules that block an action, and the demo. Done. Loop guard, approvals, keys, signed log and reload: done |
-| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; v0.1.0 released (v0.1.1 fixes the Windows build, v0.1.2 a stream gap), the SDK is on PyPI and the proxy on crates.io. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
+| 5-6 | Release builds and install scripts, live streaming under enforcement, https, approve later, alerts when a call is held, the Python SDK. Done; v0.1.0 released (v0.1.1 fixes the Windows build, v0.1.2 a stream gap, v0.1.3 mislabelled replies and redirects), the SDK is on PyPI and the proxy on crates.io. LangGraph and CrewAI adapters, docs. Verification for Postgres, Stripe, SendGrid, GitHub, Slack |
 | 7 | Rollback through an executor: done. Show HN launch |
 | 8 | Hosted control plane and Stripe billing |
 
@@ -558,6 +558,14 @@ only, while clients also end a line at a lone CR, so a provider or a
 middleman could hide a tool call from the check. Lines now end where
 clients end them, and under enforcement the agent only gets what was
 checked, written out again (see Streamed replies).
+
+v0.1.3 (2026-11-26) is a security fix of the same kind. Under enforcement
+the proxy chose the stream check by the provider's `Content-Type` and
+passed on unreadable bodies not labelled JSON, while the OpenAI SDKs read
+a stream whenever one was asked for, parse any successful reply, and
+follow redirects. Now the request decides, and unreadable, compressed and
+redirected replies are refused (see Streamed replies). crates.io still
+has 0.1.2, without this fix.
 
 The proxy is also on crates.io (`cargo install razorwire`): 0.1.0 and,
 since 2026-11-25, 0.1.2 (0.1.1 was skipped there, as it only changed the
