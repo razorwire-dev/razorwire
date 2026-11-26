@@ -367,7 +367,9 @@ pub async fn forward(
 
     // The conversation the agent sent tells us where its run stands. Read it
     // here so the parsed request is not held while the provider answers.
-    let history = match serde_json::from_slice::<Value>(&body) {
+    // Whether it asked for a stream decides how its client reads the reply,
+    // whatever the provider labels it.
+    let (history, wants_stream) = match serde_json::from_slice::<Value>(&body) {
         Ok(request) => {
             for (call_id, mut event) in openai::tool_results(&request) {
                 // Call ids are only unique per agent, so results are told
@@ -389,9 +391,10 @@ pub async fn forward(
                     state.record(Some(request_id), event).await;
                 }
             }
-            openai::History::from_request(&request)
+            let wants_stream = request.get("stream") == Some(&Value::Bool(true));
+            (openai::History::from_request(&request), wants_stream)
         }
-        Err(_) => openai::History::default(),
+        Err(_) => (openai::History::default(), false),
     };
 
     let upstream = match state
@@ -430,6 +433,36 @@ pub async fn forward(
     let enforced = enforced_policy.as_deref();
     // Calls can only be held when someone is able to approve them.
     let holds = config.keys.count(Role::Admin) > 0;
+
+    // The provider's labels are not trusted under enforcement: clients act on
+    // what they asked for and on what they can read, not on the label.
+    let raw = raw_reply_path(uri.path());
+    if enforced.is_some() && !raw {
+        // OpenAI's SDKs follow redirects, so the agent would fetch its reply
+        // from wherever the provider points, past every check here.
+        if status.is_redirection() && response_headers.contains_key(header::LOCATION) {
+            let reason = "the provider redirected the request elsewhere, where the agent would \
+                          fetch a reply Razorwire never sees";
+            return refuse_response(&state, request_id, uri.path(), reason).await;
+        }
+        // A compressed reply cannot be read here, but the agent's client
+        // would unpack it.
+        if is_encoded(&response_headers) {
+            let reason = "the response is compressed";
+            return refuse_response(&state, request_id, uri.path(), reason).await;
+        }
+    }
+    // A client that asked for a stream reads the reply as one, whatever the
+    // provider calls it. Error replies are read as plain JSON errors.
+    let read_as_stream = content_type(&response_headers).contains("event-stream")
+        || (wants_stream && status.is_success() && !raw);
+    if read_as_stream && enforced.is_some() {
+        // What goes out is rebuilt events, so it is labelled as such.
+        response_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
     let job = Job {
         state: &state,
         request_id,
@@ -438,7 +471,7 @@ pub async fn forward(
         holds,
     };
 
-    let response_body = if content_type(&response_headers).contains("event-stream") {
+    let response_body = if read_as_stream {
         match enforced_policy {
             Some(policy) if state.settings.live_streams => police_live(Live {
                 state: state.clone(),
@@ -515,10 +548,14 @@ pub async fn forward(
             }
             Err(_) => {
                 // Under an enforced policy, a response that might carry tool
-                // calls but cannot be read is not passed on.
+                // calls but cannot be read is not passed on. The label does
+                // not settle it: OpenAI's SDKs read a successful reply as JSON
+                // whatever it is labelled, with a parser that takes things
+                // this one refuses, such as a byte-order mark or NaN.
                 if enforced.is_some()
                     && !bytes.is_empty()
-                    && may_carry_tool_calls(&response_headers)
+                    && !raw
+                    && (status.is_success() || may_carry_tool_calls(&response_headers))
                 {
                     return refuse_response(
                         &state,
@@ -1067,7 +1104,34 @@ fn content_type(headers: &HeaderMap) -> String {
 /// Whether an unreadable response could still be hiding tool calls: it claims
 /// to be JSON, or it is compressed.
 fn may_carry_tool_calls(headers: &HeaderMap) -> bool {
-    content_type(headers).contains("json") || headers.contains_key(header::CONTENT_ENCODING)
+    content_type(headers).contains("json") || is_encoded(headers)
+}
+
+/// Whether the body is compressed or otherwise encoded.
+fn is_encoded(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            let value = value.to_str().unwrap_or("?").trim();
+            !value.is_empty() && !value.eq_ignore_ascii_case("identity")
+        })
+}
+
+/// Endpoints whose replies clients read as raw bytes or plain text, never as
+/// a model's reply: file and media content, speech, and transcripts. Under
+/// enforcement these may come back in any form; every other reply must be
+/// one Razorwire can read.
+fn raw_reply_path(path: &str) -> bool {
+    let path = path.trim_end_matches('/').to_ascii_lowercase();
+    [
+        "/content",
+        "/audio/speech",
+        "/audio/transcriptions",
+        "/audio/translations",
+    ]
+    .iter()
+    .any(|end| path.ends_with(end))
 }
 
 /// An error produced by the proxy itself, in the shape OpenAI SDKs expect.
@@ -1214,6 +1278,39 @@ mod tests {
         for path in ["/v1/chat/completions", "/razorwirex", "/v1/razorwire"] {
             assert!(!is_own_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn only_content_endpoints_may_send_what_cannot_be_read() {
+        for path in [
+            "/v1/files/file-abc/content",
+            "/v1/containers/c1/files/f1/content/",
+            "/v1/audio/speech",
+            "/openai/v1/audio/transcriptions",
+            "/v1/AUDIO/translations",
+        ] {
+            assert!(raw_reply_path(path), "{path}");
+        }
+        for path in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/responses/resp_1",
+            "/v1/content/chat/completions",
+            "/v1/contents",
+        ] {
+            assert!(!raw_reply_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn encoded_bodies_are_recognised() {
+        assert!(!is_encoded(&HeaderMap::new()));
+        assert!(!is_encoded(&headers(&[("content-encoding", "identity")])));
+        assert!(is_encoded(&headers(&[("content-encoding", "gzip")])));
+        assert!(is_encoded(&headers(&[
+            ("content-encoding", "identity"),
+            ("content-encoding", "br"),
+        ])));
     }
 
     #[test]

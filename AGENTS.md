@@ -154,6 +154,22 @@ cannot find something in them that the check did not see:
   duplicate key comes out once, with the value that was checked.
   serde_json's `float_roundtrip` feature keeps every number exact.
 
+The provider's labels are not trusted either, because the OpenAI SDKs do
+not trust them: they read a reply as a stream when the request asked for
+one, run `response.json()` on a successful reply whatever its
+`Content-Type` (Python's parser skips a byte-order mark and takes `NaN`),
+unpack compressed bodies, and follow redirects. So under enforcement, in
+`proxy::forward`:
+
+- A successful reply to a request with `"stream": true` goes through the
+  stream gate whatever it is labelled, and goes out as `text/event-stream`.
+  Error replies stay plain JSON, as clients read them.
+- A successful reply that is not readable JSON is refused, whatever its
+  label. So is a compressed reply, and a redirect (3xx with `Location`).
+- `proxy::raw_reply_path` exempts endpoints whose replies clients read as
+  raw bytes or text, never as a model's reply: paths ending in `/content`,
+  `/audio/speech`, `/audio/transcriptions` and `/audio/translations`.
+
 ### Loop guard
 
 Agents resend the whole conversation with every request, so the proxy reads

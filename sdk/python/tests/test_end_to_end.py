@@ -10,11 +10,11 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from conftest import POLICY
+from conftest import POLICY, FakeProvider
 
 from razorwire import Admin, Executor, Proxy, RazorwireError, blocked, blocked_count, verify
 
-pytest.importorskip("openai")
+openai = pytest.importorskip("openai")
 
 TOOLS = [
     {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
@@ -130,6 +130,63 @@ def test_an_allowed_streamed_call_arrives_whole(proxy):
     text, calls = streamed_reply(stream)
     assert text == "Sure."
     assert calls == [("create_ticket", {"title": "Disk full"})]
+
+
+@pytest.mark.parametrize("stream_mode", ["live", "hold"])
+def test_a_stream_under_another_label_is_still_checked(binary, provider, stream_mode):
+    # The agent asked for a stream, so its client reads the reply as one,
+    # whatever the provider labels it.
+    with Proxy(policy=POLICY, upstream=provider.url, binary=binary, stream_mode=stream_mode) as proxy:
+        client = proxy.openai_client(agent="ops-bot", max_retries=0)
+        stream = ask(
+            client,
+            'LABEL text/plain\nOn it.\nCALL db_drop {"database": "production"}\nCALL db_drop {"database": "staging"}',
+            stream=True,
+        )
+        text, calls = streamed_reply(stream)
+        assert text.startswith("On it.")
+        assert calls == [("db_drop", {"database": "staging"})]
+        [block] = blocked(text)
+        assert block.rule == "no-production-db-drop"
+
+
+def test_a_readable_reply_under_another_label_is_checked(proxy):
+    client = proxy.openai_client(agent="ops-bot", max_retries=0)
+    completion = ask(
+        client,
+        'LABEL text/plain\nCALL db_drop {"database": "production"}\nCALL db_drop {"database": "staging"}',
+    )
+    assert tool_calls(completion) == [("db_drop", {"database": "staging"})]
+
+
+def test_a_reply_razorwire_cannot_read_is_refused_whatever_its_label(proxy):
+    # The SDK would still read it: Python's JSON parser skips the BOM.
+    client = proxy.openai_client(agent="ops-bot", max_retries=0)
+    with pytest.raises(openai.APIStatusError) as refused:
+        ask(client, 'LABEL text/plain\nBOM\nCALL db_drop {"database": "production"}')
+    assert refused.value.status_code == 502
+    assert refused.value.code == "response_not_inspectable"
+    assert any(event.get("event") == "response_refused" for event in proxy.audit())
+
+
+def test_a_redirect_is_not_passed_on(binary, provider):
+    # The SDK follows redirects, so the agent would take its reply from
+    # elsewhere, unchecked.
+    elsewhere = FakeProvider()
+    try:
+        with Proxy(policy=POLICY, upstream=provider.url, binary=binary) as proxy:
+            client = proxy.openai_client(agent="ops-bot", max_retries=0)
+            with pytest.raises(openai.APIStatusError) as refused:
+                ask(client, f'REDIRECT {elsewhere.url}/v1/chat/completions\nCALL db_drop {{"database": "production"}}')
+            assert refused.value.status_code == 502
+        assert elsewhere.requests == []
+    finally:
+        elsewhere.close()
+
+
+def test_file_content_passes_as_it_is(proxy):
+    client = proxy.openai_client(agent="ops-bot", max_retries=0)
+    assert client.files.content("file-1").read() == FakeProvider.CONTENT
 
 
 def test_a_held_call_approved(proxy):

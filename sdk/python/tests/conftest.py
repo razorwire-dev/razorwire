@@ -45,7 +45,14 @@ class FakeProvider:
     In a streamed chat reply, `SMUGGLE <tool> <json arguments>` sends the
     call the way a hostile provider might: behind a comment, separated by a
     lone CR, which clients read as a line break.
+
+    Other lines make it misbehave the same way: `LABEL <content type>` sends
+    the chat reply under that Content-Type, `BOM` starts a plain reply with
+    a byte-order mark, and `REDIRECT <url>` answers with a redirect there.
+    A GET for a path ending in `/content` returns raw bytes.
     """
+
+    CONTENT = b"\x00raw file bytes\xff"
 
     def __init__(self):
         self.requests = []
@@ -60,28 +67,49 @@ class FakeProvider:
                 body = json.loads(self.rfile.read(length) or b"{}")
                 provider.requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
                 if self.path.endswith("/chat/completions"):
+                    tricks = provider.tricks(body)
+                    if "REDIRECT" in tricks:
+                        return self.redirect(tricks["REDIRECT"])
+                    label = tricks.get("LABEL")
                     if body.get("stream"):
-                        return self.stream(provider.chat_chunks(body), provider.smuggled_chunks(body))
-                    return self.answer(provider.chat(body))
+                        smuggled = provider.smuggled_chunks(body)
+                        return self.stream(provider.chat_chunks(body), smuggled, label or "text/event-stream")
+                    return self.answer(provider.chat(body), label=label, bom="BOM" in tricks)
                 if self.path.endswith("/responses"):
                     return self.answer(provider.responses(body))
                 self.answer({"error": {"message": "not found"}}, 404)
 
-            def answer(self, payload, status=200):
-                data = json.dumps(payload).encode()
+            def do_GET(self):
+                provider.requests.append({"path": self.path, "headers": dict(self.headers), "body": None})
+                if not self.path.endswith("/content"):
+                    return self.answer({"error": {"message": "not found"}}, 404)
+                self.send_response(200)
+                self.send_header("content-type", "application/octet-stream")
+                self.send_header("content-length", str(len(provider.CONTENT)))
+                self.end_headers()
+                self.wfile.write(provider.CONTENT)
+
+            def answer(self, payload, status=200, label=None, bom=False):
+                data = ("﻿" if bom else "").encode() + json.dumps(payload).encode()
                 self.send_response(status)
-                self.send_header("content-type", "application/json")
+                self.send_header("content-type", label or "application/json")
                 self.send_header("content-length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
 
-            def stream(self, chunks, smuggled=()):
+            def redirect(self, location):
+                self.send_response(307)
+                self.send_header("location", location)
+                self.send_header("content-length", "0")
+                self.end_headers()
+
+            def stream(self, chunks, smuggled=(), label="text/event-stream"):
                 events = [f"data: {json.dumps(chunk)}\n\n" for chunk in chunks]
                 # Hidden calls go after the first chunk, before the finish.
                 events[1:1] = [f": nothing here\rdata: {json.dumps(chunk)}\n\n" for chunk in smuggled]
                 data = ("".join(events) + "data: [DONE]\n\n").encode()
                 self.send_response(200)
-                self.send_header("content-type", "text/event-stream")
+                self.send_header("content-type", label)
                 self.send_header("content-length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -96,6 +124,8 @@ class FakeProvider:
         self.server.shutdown()
         self.server.server_close()
 
+    TRICKS = ("SMUGGLE ", "LABEL ", "REDIRECT ", "BOM")
+
     @staticmethod
     def script(text):
         said, calls = [], []
@@ -103,9 +133,19 @@ class FakeProvider:
             if line.startswith("CALL "):
                 _, tool, arguments = line.split(" ", 2)
                 calls.append((tool, arguments))
-            elif line.strip() and not line.startswith("SMUGGLE "):
+            elif line.strip() and not line.startswith(FakeProvider.TRICKS):
                 said.append(line.strip())
         return " ".join(said), calls
+
+    def tricks(self, body):
+        """The misbehaviours the last user message asks for, by name."""
+        text = self.last_user_text(body.get("messages") or []) or ""
+        found = {}
+        for line in text.splitlines():
+            name, _, value = line.partition(" ")
+            if name in ("LABEL", "REDIRECT", "BOM"):
+                found[name] = value.strip()
+        return found
 
     def smuggled_chunks(self, body):
         text = self.last_user_text(body.get("messages") or []) or ""
